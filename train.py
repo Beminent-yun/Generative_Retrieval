@@ -34,6 +34,9 @@ CONFIG = {
     "use_user_token":  True,
     "target_loss_weights": [0.4, 0.3, 0.2, 0.1],
     "max_seq_len":     50,
+    "use_sliding_window": True,
+    "window_size": 20,
+    "min_seq_len": 2,
 
     # 训练超参数
     "batch_size":      256,
@@ -188,7 +191,10 @@ def train_rec(config:dict = CONFIG):
         batch_size=config['batch_size'],
         max_seq_len=config['max_seq_len'],
         num_rq_layers=num_rq_layers,
-        num_workers=config['num_workers']
+        num_workers=config['num_workers'],
+        use_sliding_window=config.get('use_sliding_window', True),
+        window_size=config.get('window_size', 20),
+        min_seq_len=config.get('min_seq_len', 2),
     )
     
     print("Initialize Model")

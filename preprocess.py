@@ -251,8 +251,11 @@ def leave_one_out_split(
         train: 剩余所有item(历史)
     
     min_seq_len = 3: 保证至少有1个历史数据/train + 1val + 1test
+    
+    train_history[user] = 倒数第2个 item 之前的所有 item
+      -> sliding window 用这个来切割
     """
-    train, val, test = {}, {}, {}
+    train, val, test, train_hist = {}, {}, {}, {}
     skipped = 0
     
     for user_id, seq in sequences.items():
@@ -262,6 +265,9 @@ def leave_one_out_split(
         train[user_id] = seq[:-2]   # 历史序列(可能很长)
         val[user_id] = seq[-2]      # 整数
         test[user_id] = seq[-1]     # 整数
+        
+        # 保存完整的训练历史(val target之前的所有item)
+        train_hist[user_id] = seq[:-2]
     
     print(f"Leave-one-out 划分:")
     print(f"  Train: {len(train):,} 用户")
@@ -269,7 +275,7 @@ def leave_one_out_split(
     print(f"  Test:  {len(test):,} 用户")
     print(f"  跳过（序列太短）: {skipped} 用户")
     
-    return train, val, test
+    return train, val, test, train_hist
 
 import re
 # 特征工程：构建item文本
@@ -372,7 +378,7 @@ def main(
     
     sequences = build_behavior_seq(df, user2id, item2id, max_seq_len)
     
-    train, val, test = leave_one_out_split(sequences)
+    train, val, test, train_history = leave_one_out_split(sequences)
     
     item_texts, item_titles = build_item_texts(all_items_asin, meta)
     
@@ -387,6 +393,7 @@ def main(
         "train": train,
         "val": val,
         "test": test,
+        "train_history": train_history,
         
         # item feature
         "item_texts": item_texts,

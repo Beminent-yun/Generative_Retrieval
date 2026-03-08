@@ -60,12 +60,28 @@ class SeqTrainDataset(Dataset):
      
     Note:
         val 和 test 阶段的历史行为序列只用train部分，不能将val_target加入到历史序列（数据泄露）
+        
+    Sliding Window Augmentation:
+        每个用户的训练历史 → 多个训练样本
+        每个样本用不同长度的历史子序列预测下一个 item
+
+        例子（window_size=5，min_len=2）：
+        用户历史 train = [i1, i2, i3, i4, i5, i6]
+
+        样本1：history=[i1, i2],       target=i3
+        样本2：history=[i1, i2, i3],   target=i4
+        样本3：history=[i1, i2, i3, i4], target=i5
+        样本4：history=[i2, i3, i4, i5], target=i6  ← 超过 window_size，滑动
     """
     def __init__(self, user_histories: Dict[int, List[int]],    # {user_id:[item_id,...]}
                  targets: Dict[int, int],   # {user_id:target_item_id}
                  semantic_ids: np.ndarray,  # Look up table (num_items, num_rq_layers)
                  max_seq_len:int = 50,  # 用户历史行为序列的最大长度（item数）
-                 num_rq_layers:int = 3):    # 每个item对应几个token/code
+                 num_rq_layers:int = 3,     # 每个item对应几个token/code
+                 use_sliding_window: bool = True,
+                 window_size:int = 20,  # 历史窗口最大长度
+                 min_seq_len: int = 2,  # 历史序列的最小长度
+                 ):    
         if semantic_ids.ndim != 2:
             raise ValueError(f"semantic_ids must be 2D [num_items, num_rq_layers], got shape={semantic_ids.shape}")
 
@@ -75,6 +91,13 @@ class SeqTrainDataset(Dataset):
                 f"num_rq_layers ({num_rq_layers}) does not match semantic_ids second dim ({sid_layers})"
             )
 
+        if min_seq_len < 1:
+            raise ValueError(f"min_seq_len must be >= 1, got {min_seq_len}")
+        if window_size < 1:
+            raise ValueError(f"window_size must be >= 1, got {window_size}")
+
+        self.user_histories = user_histories
+        self.targets = targets
         self.semantic_ids = semantic_ids
         self.max_seq_len = max_seq_len
         self.num_rq_layers = num_rq_layers
@@ -82,16 +105,45 @@ class SeqTrainDataset(Dataset):
         # max_tokens: BOS + max_seq_len * num_rq_layers(1id->num_rq_layers token)
         self.max_tokens = 1 + max_seq_len * num_rq_layers
         
+        self.use_sliding_window = use_sliding_window
+        self.window_size = window_size
+        self.min_seq_len = min_seq_len
+        
         # 构建样本列表
-        self.samples = []
-        for user_id, history in user_histories.items():
-            if user_id not in targets:
-                continue
-            if len(history) == 0:
-                continue
-            self.samples.append((int(user_id), history, targets[user_id]))
+        self.samples = self._build_samples()
+        
+    def _build_samples(self):
+        """
+        构建所有训练样本
+        
+        use_sliding_window=True: 训练增强，多样本
+        use_sliding_window=False: 每用户单样本
+        """
+        samples = []
 
-        print(f"SeqTrainDataset: {len(self.samples):,} 个样本")
+        for user_id, target in self.targets.items():
+            history = self.user_histories.get(user_id)
+            if history is None or len(history) == 0:
+                continue
+
+            if self.use_sliding_window:
+                # 历史太短：退化成单样本
+                if len(history) < self.min_seq_len:
+                    samples.append((user_id, history[-self.window_size:], target))
+                    continue
+
+                # 历史内部切窗：用 history[:end] 预测 history[end]
+                for end in range(self.min_seq_len, len(history)):
+                    sub_hist = history[max(0, end - self.window_size):end]
+                    sub_target = history[end]
+                    samples.append((user_id, sub_hist, sub_target))
+
+                # 再补一个“真实训练目标”样本（history -> target）
+                samples.append((user_id, history[-self.window_size:], target))
+            else:
+                samples.append((user_id, history[-self.window_size:], target))
+
+        return samples
     
     def _item_to_tokens(self, item_id:int) -> List[int]:
         """
@@ -175,7 +227,8 @@ class SeqEvalDataset(Dataset):
                                       targets,
                                       semantic_ids,
                                       max_seq_len,
-                                      num_rq_layers)
+                                      num_rq_layers,
+                                      use_sliding_window=False)
 
     def __len__(self) -> int:
         return len(self._inner)
@@ -239,7 +292,10 @@ def get_rec_loaders(
     batch_size:int = 256,
     max_seq_len: int=50,
     num_rq_layers: int = 3,
-    num_workers: int = 2
+    num_workers: int = 2,
+    use_sliding_window: bool = True,
+    window_size: int = 20,
+    min_seq_len: int = 2,
 ):
     """
     推荐模型的 DataLoader
@@ -275,6 +331,9 @@ def get_rec_loaders(
     train_ds = SeqTrainDataset(
         user_histories=train_histories,
         targets=train_targets,
+        use_sliding_window=use_sliding_window,
+        window_size=window_size, # 历史窗口大小
+        min_seq_len=min_seq_len,  # 最短历史长度 -> 至少需要2个item历史才能生成样本
         **common_kwargs
     )
     # val验证集：历史=train序列，目标=val target

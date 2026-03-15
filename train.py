@@ -1,13 +1,12 @@
 import os
 import json
 import pickle
+import time
 from pathlib import Path
 import torch
 import numpy as np
 import swanlab
 from tqdm.auto import tqdm
-from pathlib import Path
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from Amazon_Dataset import get_rec_loaders
 from evaluate import build_sid_to_item, evaluate, print_metrics
@@ -31,12 +30,14 @@ CONFIG = {
     "dropout_rate":         0.1,
     "num_rq_layers":   4,
     "codebook_size":   256,
-    "use_user_token":  True,
+    "use_user_token":  False,
     "target_loss_weights": [0.4, 0.3, 0.2, 0.1],
     "max_seq_len":     50,
     "use_sliding_window": True,
+    "sliding_window_mode": "sample_per_epoch",
     "window_size": 20,
     "min_seq_len": 2,
+    "windows_per_user": 2,
 
     # 训练超参数
     "batch_size":      256,
@@ -46,9 +47,15 @@ CONFIG = {
     "weight_decay":    5e-5,
     "warmup_epochs":   1,
     "patience":        10,
+    "amp_enabled":     True,
+    "amp_dtype":       "auto",
 
     # 评估
-    "beam_size":       20,
+    "beam_size":       40,
+    "beam_schedule":   [40, 20, 8, 1],
+    "train_eval_beam_size": 10,
+    "train_eval_beam_schedule": [10, 5, 2, 1],
+    "train_eval_topk": [1, 5, 10],
     "topk":            [1, 5, 10, 20, 40],
     
     "device":           'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu',
@@ -99,6 +106,33 @@ class WarmupCosineScheduler:
             param_group['lr'] = lr
             
         return lr
+
+
+def resolve_amp_settings(config: dict, device: str) -> tuple[bool, torch.dtype | None, bool]:
+    """
+    训练期 AMP 只在 CUDA 上启用。
+    默认优先 bf16，不支持时回退到 fp16；只有 fp16 需要 GradScaler。
+    """
+    amp_enabled = bool(config.get("amp_enabled", True)) and device == "cuda"
+    if not amp_enabled:
+        return False, None, False
+
+    amp_dtype = str(config.get("amp_dtype", "auto")).lower()
+    bf16_supported = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+
+    if amp_dtype == "auto":
+        chosen_dtype = torch.bfloat16 if bf16_supported else torch.float16
+    elif amp_dtype == "bf16":
+        if not bf16_supported:
+            raise ValueError("amp_dtype='bf16' requires CUDA bf16 support")
+        chosen_dtype = torch.bfloat16
+    elif amp_dtype == "fp16":
+        chosen_dtype = torch.float16
+    else:
+        raise ValueError(f"Unsupported amp_dtype: {config.get('amp_dtype')}")
+
+    grad_scaler_enabled = chosen_dtype == torch.float16
+    return True, chosen_dtype, grad_scaler_enabled
     
 
 def train_one_epoch(
@@ -106,7 +140,10 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
-    epoch: int
+    epoch: int,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
+    scaler: torch.amp.GradScaler | None = None,
 )->tuple[float, float]:
     """
     训练一个epoch, 返回平均loss
@@ -115,25 +152,39 @@ def train_one_epoch(
     total_loss = 0.0
     total_acc = 0.0
     num_batches = len(loader)
+    autocast_device_type = "cuda" if device == "cuda" else "cpu"
     
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]', leave=False)
     for batch in pbar:
-        user_ids = batch['user_id'].to(device)   # [B]
-        input_ids = batch['input_ids'].to(device)   # [B, T]
-        attention_mask = batch['attention_mask'].to(device) # [B, T]
-        target_ids = batch['target_ids'].to(device) # [B, L]
+        user_ids = batch['user_id'].to(device, non_blocking=True)   # [B]
+        input_ids = batch['input_ids'].to(device, non_blocking=True)   # [B, T]
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True) # [B, T]
+        target_ids = batch['target_ids'].to(device, non_blocking=True) # [B, L]
         
+        optimizer.zero_grad(set_to_none=True)
+
         # forward + calculate loss
-        outputs = model.compute_loss(input_ids, attention_mask, target_ids, user_ids)
-        loss = outputs["loss"]
-        acc = outputs["acc"]
+        with torch.autocast(
+            device_type=autocast_device_type,
+            dtype=amp_dtype,
+            enabled=amp_enabled
+        ):
+            outputs = model.compute_loss(input_ids, attention_mask, target_ids, user_ids)
+            loss = outputs["loss"]
+            acc = outputs["acc"]
         
         # backward
-        optimizer.zero_grad()
-        loss.backward()
-        # 截断梯度，防止梯度爆炸
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            # 截断梯度，防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         
         total_loss += loss.item()
         total_acc += acc.item()
@@ -155,6 +206,15 @@ def train_rec(config:dict = CONFIG):
     latest_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     
     print(f"Using {device}..")
+
+    amp_enabled, amp_dtype, grad_scaler_enabled = resolve_amp_settings(config, device)
+    scaler = torch.amp.GradScaler("cuda", enabled=grad_scaler_enabled)
+    amp_dtype_name = "fp32" if amp_dtype is None else ("bf16" if amp_dtype == torch.bfloat16 else "fp16")
+    print(
+        f"AMP | amp_enabled={amp_enabled} "
+        f"amp_dtype={amp_dtype_name} "
+        f"grad_scaler_enabled={scaler.is_enabled()}"
+    )
     
     print("Loading Data..")
     with open(config['data_path'], 'rb') as f:
@@ -193,8 +253,11 @@ def train_rec(config:dict = CONFIG):
         num_rq_layers=num_rq_layers,
         num_workers=config['num_workers'],
         use_sliding_window=config.get('use_sliding_window', True),
+        sliding_window_mode=config.get('sliding_window_mode', 'all'),
         window_size=config.get('window_size', 20),
         min_seq_len=config.get('min_seq_len', 2),
+        windows_per_user=config.get('windows_per_user', 2),
+        seed=config['seed'],
     )
     
     print("Initialize Model")
@@ -248,6 +311,8 @@ def train_rec(config:dict = CONFIG):
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model_state'])
         optimizer.load_state_dict(ckpt['optimizer_state'])
+        if scaler.is_enabled() and ckpt.get('scaler_state') is not None:
+            scaler.load_state_dict(ckpt['scaler_state'])
         best_val_ndcg = ckpt.get('best_val_ndcg', 0.0)
         patience_count = ckpt.get('patience_count', 0)
         history = ckpt.get('history', [])
@@ -260,43 +325,70 @@ def train_rec(config:dict = CONFIG):
     swanlab.init(
         project="Generated_Retrieval",
         experiment_name="CausalTransformer",
-        config=config
+        config={
+            **config,
+            "amp_enabled_runtime": amp_enabled,
+            "amp_dtype_runtime": amp_dtype_name,
+            "grad_scaler_enabled_runtime": scaler.is_enabled(),
+        }
     )
 
     print("Start Training..")
 
     # 早停监控的主指标
     # 优先用 NDCG@10, 如果 topk 里面没有 10 就用最大的 K 
-    monitor_k = 10 if 10 in config['topk'] else max(config['topk'])
+    train_eval_topk = config.get('train_eval_topk', config['topk'])
+    monitor_k = 10 if 10 in train_eval_topk else max(train_eval_topk)
 
     for epoch in range(start_epoch, config['epochs'] + 1):
         # update learning rate
         current_lr = scheduler.step(epoch)
+
+        if hasattr(train_loader.dataset, "resample_samples"):
+            train_loader.dataset.resample_samples(epoch)
+        train_num_samples = len(train_loader.dataset)
+        print(f"Epoch {epoch:3d} train_samples={train_num_samples}")
         
         # 训练一个epoch
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, device, epoch
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
         )
         
         if epoch % config['every_epoch'] == 0 or epoch == config['epochs']:
+            eval_start = time.perf_counter()
             val_metrics = evaluate(
                 model=model,
                 loader=val_loader,
                 sid2item=sid2item,
-                topk=config['topk'],
-                beam_size=config['beam_size'],
+                topk=train_eval_topk,
+                beam_size=config.get('train_eval_beam_size', config['beam_size']),
                 device=device,
+                beam_schedule=config.get('train_eval_beam_schedule'),
                 split='val'
             )
+            eval_time = time.perf_counter() - eval_start
             
             print(f"\nEpoch: {epoch:3d}/{config['epochs']} lr={current_lr:.2e} loss={train_loss:.4f} acc={train_acc:.4f}")
-            print_metrics(val_metrics, config['topk'], prefix='Val')
+            print_metrics(val_metrics, train_eval_topk, prefix='Val')
+            print(f"Val decode_time={eval_time:.2f}s")
             
             history.append({
                 'epoch': epoch,
                 'train_loss': train_loss,
                 'train_acc': train_acc,
+                'train_num_samples': train_num_samples,
                 'lr': current_lr,
+                'amp_enabled': amp_enabled,
+                'amp_dtype': amp_dtype_name,
+                'grad_scaler_enabled': scaler.is_enabled(),
+                'val_decode_time_sec': eval_time,
                 **{f"val_{k}": v for k, v in val_metrics.items()}
             })
 
@@ -305,6 +397,10 @@ def train_rec(config:dict = CONFIG):
                 'train/loss': train_loss,
                 'train/acc': train_acc,
                 'train/lr': current_lr,
+                'train/num_samples': train_num_samples,
+                'train/amp_enabled': float(amp_enabled),
+                'train/grad_scaler_enabled': float(scaler.is_enabled()),
+                'val/decode_time_sec': eval_time,
                 **{f'val/{k}': v for k, v in val_metrics.items()}
             }, step=epoch)
             
@@ -319,6 +415,7 @@ def train_rec(config:dict = CONFIG):
                     'epoch': epoch,
                     'model_state': model.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
+                    'scaler_state': scaler.state_dict() if scaler.is_enabled() else None,
                     'val_metrics': val_metrics,
                     'config': config
                 }, best_ckpt_path)
@@ -337,6 +434,7 @@ def train_rec(config:dict = CONFIG):
                     'epoch': epoch,
                     'model_state': model.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
+                    'scaler_state': scaler.state_dict() if scaler.is_enabled() else None,
                     'best_val_ndcg': best_val_ndcg,
                     'patience_count': patience_count,
                     'history': history,
@@ -345,7 +443,15 @@ def train_rec(config:dict = CONFIG):
                 print(f"Saved latest checkpoint to {latest_ckpt_path}")
         else:
             # 非评估轮次只打印 loss
-            print(f"Epoch {epoch:3d} | loss={train_loss:.4f} acc={train_acc:.4f} | (skip eval)")
+            swanlab.log({
+                'train/loss': train_loss,
+                'train/acc': train_acc,
+                'train/lr': current_lr,
+                'train/num_samples': train_num_samples,
+                'train/amp_enabled': float(amp_enabled),
+                'train/grad_scaler_enabled': float(scaler.is_enabled()),
+            }, step=epoch)
+            print(f"Epoch {epoch:3d} | loss={train_loss:.4f} acc={train_acc:.4f} samples={train_num_samples} | (skip eval)")
     
     print("Start Evaluating..")
     eval_ckpt_path = best_ckpt_path if best_ckpt_path.exists() else latest_ckpt_path if latest_ckpt_path.exists() else None
@@ -366,6 +472,7 @@ def train_rec(config:dict = CONFIG):
         topk=config['topk'],
         beam_size=config['beam_size'],
         device=device,
+        beam_schedule=config.get('beam_schedule'),
         split='test'
     )
     

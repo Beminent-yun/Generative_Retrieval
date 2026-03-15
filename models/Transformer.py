@@ -41,6 +41,9 @@ class CausalTransformer(nn.Module):
         self.codebook_size = codebook_size
         self.use_user_token = use_user_token
         self.CODE_OFFSET = 3
+        self.PAD_TOKEN = 0
+        self._causal_mask_cache: dict[tuple[str, int], torch.Tensor] = {}
+        self._rq_pos_cache: dict[tuple[str, int], torch.Tensor] = {}
 
         self.user_emb = None
         if self.use_user_token:
@@ -93,16 +96,25 @@ class CausalTransformer(nn.Module):
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
+                if module.padding_idx is not None:
+                    with torch.no_grad():
+                        module.weight[module.padding_idx].zero_()
     
+    def _cache_key(self, device: torch.device, seq_len: int) -> tuple[str, int]:
+        return (str(device), seq_len)
+
     def _make_causal_mask(self, seq_len:int, device) -> torch.Tensor:
         """
         上三角 causal mask（bool）：True 表示被屏蔽，False 表示可见。
         与 src_key_padding_mask 保持同类型，避免不同 dtype 在部分 CUDA 版本上的数值异常。
         """
-        return torch.triu(
-            torch.ones((seq_len, seq_len), dtype=torch.bool, device=device),
-            diagonal=1
-        )
+        cache_key = self._cache_key(device, seq_len)
+        if cache_key not in self._causal_mask_cache:
+            self._causal_mask_cache[cache_key] = torch.triu(
+                torch.ones((seq_len, seq_len), dtype=torch.bool, device=device),
+                diagonal=1
+            )
+        return self._causal_mask_cache[cache_key]
         
 
     def _make_rq_position_ids(self, seq_len:int, device) -> torch.tensor:
@@ -111,12 +123,139 @@ class CausalTransformer(nn.Module):
         序列:      [BOS, c0_item#0, c1_item#0, c2_item#0, c0_item#1, ...]
         pos_emb:   [0,     0,          1,      2,          0, .      ...]
         """
-        positions = [0] # BOS位置为0
-        L = self.num_rq_layers  # codebook 个数/RQ层数
-        remaining = seq_len - 1 # 除去BOS的序列长度
-        for i in range(remaining):
-            positions.append(i % L)
-        return torch.tensor(positions[:seq_len], device=device)
+        cache_key = self._cache_key(device, seq_len)
+        if cache_key not in self._rq_pos_cache:
+            if seq_len <= 0:
+                positions = torch.empty(0, dtype=torch.long, device=device)
+            else:
+                positions = torch.zeros(seq_len, dtype=torch.long, device=device)
+                if seq_len > 1:
+                    positions[1:] = torch.arange(seq_len - 1, device=device) % self.num_rq_layers
+            self._rq_pos_cache[cache_key] = positions
+        return self._rq_pos_cache[cache_key]
+
+    def _compact_left_padded_inputs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        将左 padding 的输入压紧为“有效 token 左对齐、右侧 padding”的布局。
+        这样 BOS 恒定在位置 0，位置编码和 padding mask 都能按真实序列工作。
+        """
+        if input_ids.shape != attention_mask.shape:
+            raise ValueError(
+                f"input_ids shape {input_ids.shape} must match attention_mask shape {attention_mask.shape}"
+            )
+
+        batch_size, full_len = input_ids.shape
+        valid_lengths = attention_mask.sum(dim=1, dtype=torch.long)
+        max_valid_len = int(valid_lengths.max().item())
+
+        compact_ids = input_ids.new_full((batch_size, max_valid_len), self.PAD_TOKEN)
+        compact_mask = attention_mask.new_zeros((batch_size, max_valid_len))
+
+        for row, valid_len in enumerate(valid_lengths.tolist()):
+            if valid_len <= 0:
+                continue
+            compact_ids[row, :valid_len] = input_ids[row, full_len - valid_len:full_len]
+            compact_mask[row, :valid_len] = 1
+
+        return compact_ids, compact_mask, valid_lengths
+
+    def prepare_compact_inputs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        评估/解码专用：将 left-padded 输入压紧为紧凑布局，并返回有效长度。
+        """
+        return self._compact_left_padded_inputs(input_ids, attention_mask)
+
+    def _append_prefix_to_compact_inputs(
+        self,
+        compact_ids: torch.Tensor,
+        compact_mask: torch.Tensor,
+        prefix_ids: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid_lengths = compact_mask.sum(dim=1, dtype=torch.long)
+
+        if prefix_ids is None or prefix_ids.numel() == 0:
+            return compact_ids, compact_mask, valid_lengths
+
+        if prefix_ids.dim() != 2:
+            raise ValueError(f"prefix_ids must be 2D [B, S], got shape={prefix_ids.shape}")
+        if prefix_ids.size(0) != compact_ids.size(0):
+            raise ValueError(
+                f"prefix_ids batch size ({prefix_ids.size(0)}) must match compact_ids batch size ({compact_ids.size(0)})"
+            )
+
+        prefix_len = prefix_ids.size(1)
+        history_width = compact_ids.size(1)
+        total_width = history_width + prefix_len
+
+        merged_ids = compact_ids.new_full((compact_ids.size(0), total_width), self.PAD_TOKEN)
+        merged_mask = compact_mask.new_zeros((compact_mask.size(0), total_width))
+        merged_ids[:, :history_width] = compact_ids
+        merged_mask[:, :history_width] = compact_mask
+
+        prefix_positions = valid_lengths.unsqueeze(1) + torch.arange(prefix_len, device=compact_ids.device).unsqueeze(0)
+        merged_ids.scatter_(1, prefix_positions, prefix_ids)
+        merged_mask.scatter_(
+            1,
+            prefix_positions,
+            torch.ones_like(prefix_ids, dtype=compact_mask.dtype, device=compact_mask.device)
+        )
+
+        return merged_ids, merged_mask, valid_lengths + prefix_len
+
+    def _restore_left_padding_layout(
+        self,
+        compact_logits: torch.Tensor,
+        full_len: int,
+        valid_lengths: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        将压紧序列上的 logits 映射回原始左 padding 布局。
+        这样训练和生成阶段依然可以沿用“最后几个位置就是最新 token”的取法。
+        """
+        batch_size = compact_logits.size(0)
+        full_logits = compact_logits.new_zeros((batch_size, full_len, self.vocab_size))
+
+        for row, valid_len in enumerate(valid_lengths.tolist()):
+            if valid_len <= 0:
+                continue
+            full_logits[row, full_len - valid_len:full_len] = compact_logits[row, :valid_len]
+
+        return full_logits
+
+    def _encode_compact_inputs(
+        self,
+        compact_ids: torch.Tensor,
+        compact_mask: torch.Tensor,
+        user_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        _, seq_len = compact_ids.shape
+        device = compact_ids.device
+
+        x = self.pos_enc(self.token_emb(compact_ids))
+        rq_pos_id = self._make_rq_position_ids(seq_len, device)
+        x = x + self.rq_pos_emb(rq_pos_id).unsqueeze(0)
+
+        if self.use_user_token:
+            if user_ids is None:
+                raise ValueError("user_ids must be provided when use_user_token=True")
+            x[:, 0, :] = x[:, 0, :] + self.user_emb(user_ids)
+
+        attn_mask = self._make_causal_mask(seq_len, device)
+        key_padding_mask = ~compact_mask.bool()
+
+        return self.transformer(
+            src=x,
+            mask=attn_mask,
+            src_key_padding_mask=key_padding_mask
+        )
 
     def _mask_invalid_code_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """
@@ -139,35 +278,36 @@ class CausalTransformer(nn.Module):
         返回 logits [B, T, ,vocab_size]
         """
         
-        B, T = input_ids.shape
-        device = input_ids.device
-        
-        # x = token_emb + pos_emb   # [B, T, D] + [B, T, D] = [B, T, D]
-        x = self.pos_enc(self.token_emb(input_ids))
-        
-        # 加入层间位置嵌入
-        rq_pos_id = self._make_rq_position_ids(T, device)   # [T, D]
-        x = x + self.rq_pos_emb(rq_pos_id).unsqueeze(0) # [B, T, D] + [1, T, D]
-        
-        # User-Token: 把user_embedding加到第一个位置(BOS位置)
-        # BOS token 同时携带了用户身份信息
-        if self.use_user_token:
-            if user_ids is None:
-                raise ValueError("user_ids must be provided when use_user_token=True")
-            user_vec = self.user_emb(user_ids)  # [B, d_model]
-            x[:, 0, :] = x[:, 0, :] + user_vec
-        
-        attn_mask = self._make_causal_mask(T, device)
-        
-        # Transformer(decoder-only, 用 x 作为memory和target)
-        # NOTE:
-        # 在左 padding 场景下，src_key_padding_mask 在部分后端上会导致注意力行被完全屏蔽，
-        # 进而产生 NaN。这里统一仅使用 causal mask，保证数值稳定。
-        out = self.transformer(src=x, mask=attn_mask)
-        
-        logits = self.lm_head(out)  # [B, T, vocab_size]
+        full_len = input_ids.size(1)
+        compact_ids, compact_mask, valid_lengths = self.prepare_compact_inputs(
+            input_ids, attention_mask
+        )
+        out = self._encode_compact_inputs(compact_ids, compact_mask, user_ids)
+        compact_logits = self.lm_head(out)  # [B, T, vocab_size]
+        logits = self._restore_left_padding_layout(compact_logits, full_len, valid_lengths)
         
         return logits
+
+    def decode_last_logits(
+        self,
+        compact_ids: torch.Tensor,
+        compact_mask: torch.Tensor,
+        user_ids: torch.Tensor,
+        prefix_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        评估/Beam Search 专用：在紧凑 history 后拼接 prefix，仅返回最后一个位置的 logits。
+        """
+        merged_ids, merged_mask, merged_lengths = self._append_prefix_to_compact_inputs(
+            compact_ids, compact_mask, prefix_ids
+        )
+        hidden = self._encode_compact_inputs(merged_ids, merged_mask, user_ids)
+        last_indices = merged_lengths - 1
+        last_hidden = hidden[
+            torch.arange(hidden.size(0), device=hidden.device),
+            last_indices
+        ]
+        return self.lm_head(last_hidden)
     
     def compute_loss(self,input_ids: torch.tensor,  # [B, T]
                      attention_mask:torch.tensor,   # [B, T]

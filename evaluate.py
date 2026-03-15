@@ -1,13 +1,14 @@
 from Amazon_Dataset import get_rec_loaders
 import argparse
 import pickle
+import time
 from tqdm.auto import tqdm
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from metrics import hr_at_k, ndcg_at_k
 from typing import Dict, List, Tuple
 import numpy as np
+from collections import defaultdict
 from models.Transformer import CausalTransformer
 
 
@@ -117,6 +118,121 @@ def build_prefix_to_next_tokens(
     return {k: sorted(v) for k, v in prefix_to_next.items()}
 
 
+def build_prefix_constraint_tables(
+    sid2item: Dict[tuple, List[int]],
+    vocab_size: int,
+    code_offset: int = 3
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """
+    构建逐层前缀约束表：
+    - allowed_masks[step][state, token] -> 当前前缀状态下该 token 是否可扩展
+    - next_state_tables[step][state, token] -> 选择 token 后进入的下一层前缀状态
+    """
+    raw_sids = list(sid2item.keys())
+    if not raw_sids:
+        raise ValueError("sid2item is empty; cannot build constrained beam tables")
+
+    num_rq_layers = len(raw_sids[0])
+    prefix_children_by_depth = [defaultdict(set) for _ in range(num_rq_layers)]
+
+    for raw_sid in raw_sids:
+        token_sid = tuple(code + code_offset for code in raw_sid)
+        for depth in range(num_rq_layers):
+            prefix = token_sid[:depth]
+            prefix_children_by_depth[depth][prefix].add(token_sid[depth])
+
+    prefix_state_maps = []
+    for depth in range(num_rq_layers):
+        prefixes = sorted(prefix_children_by_depth[depth].keys())
+        prefix_state_maps.append({prefix: idx for idx, prefix in enumerate(prefixes)})
+
+    allowed_masks = []
+    next_state_tables = []
+
+    for depth in range(num_rq_layers):
+        state_map = prefix_state_maps[depth]
+        allowed_mask = torch.zeros((len(state_map), vocab_size), dtype=torch.bool)
+
+        if depth < num_rq_layers - 1:
+            next_state_table = torch.full((len(state_map), vocab_size), -1, dtype=torch.long)
+            next_state_map = prefix_state_maps[depth + 1]
+        else:
+            next_state_table = torch.empty((0, 0), dtype=torch.long)
+            next_state_map = None
+
+        for prefix, row_idx in state_map.items():
+            for token in sorted(prefix_children_by_depth[depth][prefix]):
+                allowed_mask[row_idx, token] = True
+                if next_state_map is not None:
+                    next_state_table[row_idx, token] = next_state_map[prefix + (token,)]
+
+        allowed_masks.append(allowed_mask)
+        next_state_tables.append(next_state_table)
+
+    return allowed_masks, next_state_tables
+
+
+def move_constraint_tables_to_device(
+    allowed_masks: list[torch.Tensor],
+    next_state_tables: list[torch.Tensor],
+    device: torch.device
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    return (
+        [mask.to(device, non_blocking=True) for mask in allowed_masks],
+        [table.to(device, non_blocking=True) for table in next_state_tables]
+    )
+
+
+def build_dynamic_beam_schedule(max_beam_size: int, num_steps: int) -> List[int]:
+    """
+    默认动态 beam schedule：
+    - L=4, beam=20 -> [20, 10, 4, 1]
+    - L=4, beam=10 -> [10, 5, 2, 1]
+    """
+    if num_steps <= 0:
+        return []
+    if num_steps == 1:
+        return [max(1, max_beam_size)]
+
+    schedule = [max(1, max_beam_size)]
+    for step in range(1, num_steps - 1):
+        progress = step / (num_steps - 1)
+        value = int(max_beam_size * ((1.0 - progress) ** 1.5))
+        schedule.append(max(1, value))
+    schedule.append(1)
+
+    for idx in range(1, len(schedule)):
+        schedule[idx] = min(schedule[idx - 1], schedule[idx])
+    return schedule
+
+
+def normalize_beam_schedule(
+    beam_size: int,
+    num_steps: int,
+    beam_schedule: List[int] | None = None
+) -> List[int]:
+    if beam_schedule is None:
+        return build_dynamic_beam_schedule(beam_size, num_steps)
+
+    if len(beam_schedule) != num_steps:
+        raise ValueError(
+            f"beam_schedule length ({len(beam_schedule)}) must equal num_rq_layers ({num_steps})"
+        )
+
+    normalized = [max(1, min(beam_size, int(v))) for v in beam_schedule]
+    normalized[0] = min(normalized[0], beam_size)
+    normalized[-1] = 1
+    for idx in range(1, len(normalized)):
+        normalized[idx] = min(normalized[idx - 1], normalized[idx])
+    return normalized
+
+
+def resolve_eval_amp_settings(device: str) -> tuple[bool, torch.dtype | None]:
+    if device == "cuda" and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+        return True, torch.bfloat16
+    return False, None
+
+
 @torch.inference_mode()
 def generate_beam_constrained(
     model: CausalTransformer,
@@ -124,7 +240,11 @@ def generate_beam_constrained(
     attention_mask: torch.Tensor,
     user_ids: torch.Tensor,
     beam_size: int,
-    prefix_to_next: Dict[tuple, List[int]],
+    allowed_masks: list[torch.Tensor],
+    next_state_tables: list[torch.Tensor],
+    beam_schedule: List[int] | None = None,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
     基于有效 SID 前缀的约束 Beam Search。
@@ -135,50 +255,47 @@ def generate_beam_constrained(
     device = input_ids.device
     L = model.num_rq_layers
     V = model.vocab_size
+    autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
+    resolved_beam_schedule = normalize_beam_schedule(beam_size, L, beam_schedule)
+    compact_input_ids, compact_attention_mask, _ = model.prepare_compact_inputs(
+        input_ids, attention_mask
+    )
+    compact_width = compact_input_ids.size(1)
 
     beams = torch.zeros((B, 1, L), dtype=torch.long, device=device)
     beam_scores = torch.zeros((B, 1), dtype=torch.float32, device=device)
+    beam_states = torch.zeros((B, 1), dtype=torch.long, device=device)
 
     for step in range(L):
         curr_beam = beams.size(1)
-
-        exp_input = input_ids.unsqueeze(1).expand(-1, curr_beam, -1).reshape(B * curr_beam, T)
-        exp_mask = attention_mask.unsqueeze(1).expand(-1, curr_beam, -1).reshape(B * curr_beam, T)
-
-        if step > 0:
-            prefixes_flat = beams[:, :, :step].reshape(B * curr_beam, step)
-            ext_ids = torch.cat([exp_input, prefixes_flat], dim=1)
-            ext_mask = torch.cat([
-                exp_mask,
-                torch.ones(B * curr_beam, step, dtype=attention_mask.dtype, device=device)
-            ], dim=1)
-        else:
-            ext_ids = exp_input
-            ext_mask = exp_mask
+        exp_compact_ids = compact_input_ids.unsqueeze(1).expand(-1, curr_beam, -1).reshape(B * curr_beam, compact_width)
+        exp_compact_mask = compact_attention_mask.unsqueeze(1).expand(-1, curr_beam, -1).reshape(B * curr_beam, compact_width)
+        prefixes_flat = beams[:, :, :step].reshape(B * curr_beam, step) if step > 0 else None
 
         exp_user_ids = user_ids.unsqueeze(1).expand(-1, curr_beam).reshape(B * curr_beam)
-        logits = model(ext_ids, ext_mask, exp_user_ids)[:, -1, :]
-        log_prob = torch.log_softmax(logits, dim=-1)
+        with torch.autocast(
+            device_type=autocast_device_type,
+            dtype=amp_dtype,
+            enabled=amp_enabled
+        ):
+            logits = model.decode_last_logits(
+                exp_compact_ids,
+                exp_compact_mask,
+                exp_user_ids,
+                prefix_ids=prefixes_flat
+            )
 
-        masked_log_prob = torch.full_like(log_prob, float('-inf'))
-
-        if step > 0:
-            prefixes = prefixes_flat.tolist()
-        else:
-            prefixes = [()] * (B * curr_beam)
-
-        for i, prefix in enumerate(prefixes):
-            key = tuple(prefix)
-            allowed = prefix_to_next.get(key, [])
-            if allowed:
-                allowed_idx = torch.tensor(allowed, dtype=torch.long, device=device)
-                masked_log_prob[i, allowed_idx] = log_prob[i, allowed_idx]
+        log_prob = torch.log_softmax(logits.float(), dim=-1)
+        state_ids = beam_states.reshape(-1)
+        allowed_mask = allowed_masks[step].index_select(0, state_ids)
+        masked_log_prob = log_prob.masked_fill(~allowed_mask, float('-inf'))
 
         masked_log_prob = masked_log_prob.view(B, curr_beam, V)
         total_scores = beam_scores.unsqueeze(-1) + masked_log_prob
         flat_scores = total_scores.view(B, curr_beam * V)
 
-        k = min(beam_size, flat_scores.size(1))
+        step_beam_size = resolved_beam_schedule[step]
+        k = min(step_beam_size, flat_scores.size(1))
         new_scores, new_pos = torch.topk(flat_scores, k, dim=-1)
         parent_idx = new_pos // V
         token_idx = new_pos % V
@@ -188,6 +305,14 @@ def generate_beam_constrained(
 
         beams = new_beams
         beam_scores = new_scores
+
+        if step < L - 1:
+            parent_states = beam_states.gather(1, parent_idx)
+            next_states = next_state_tables[step][
+                parent_states.reshape(-1),
+                token_idx.reshape(-1)
+            ].view(B, k)
+            beam_states = next_states
 
     return beams
 
@@ -200,6 +325,7 @@ def evaluate(
     topk: List[int],
     beam_size:int,
     device:str,
+    beam_schedule: List[int] | None = None,
     split:str = 'val',
     print_hit_samples: int = 0
 ) -> Dict[str, float]:
@@ -217,10 +343,31 @@ def evaluate(
        "HR@5": 0.098, "NDCG@5": 0.071, ...}
     """
     
-    print(f"Using {device}.. decode_mode=constrained")
+    if max(topk) > beam_size:
+        raise ValueError(
+            f"max(topk)={max(topk)} exceeds beam_size={beam_size}. "
+            "Increase beam_size or reduce topk to avoid truncated metrics."
+        )
+
+    amp_enabled, amp_dtype = resolve_eval_amp_settings(device)
+    amp_dtype_name = "fp32" if amp_dtype is None else "bf16"
+    resolved_beam_schedule = normalize_beam_schedule(beam_size, model.num_rq_layers, beam_schedule)
+    print(
+        f"Using {device}.. decode_mode=constrained "
+        f"beam_schedule={resolved_beam_schedule} eval_amp={amp_dtype_name}"
+    )
 
     code_offset = model.CODE_OFFSET
-    prefix_to_next = build_prefix_to_next_tokens(sid2item, code_offset=code_offset)
+    allowed_masks, next_state_tables = build_prefix_constraint_tables(
+        sid2item,
+        vocab_size=model.vocab_size,
+        code_offset=code_offset
+    )
+    allowed_masks, next_state_tables = move_constraint_tables_to_device(
+        allowed_masks,
+        next_state_tables,
+        torch.device(device)
+    )
     
     model.eval()
     
@@ -231,31 +378,44 @@ def evaluate(
     total_empty_candidates = 0
     total_candidate_count = 0
     hit_samples_printed = 0
+    total_decode_time = 0.0
+    total_candidate_time = 0.0
+    total_metric_time = 0.0
+    num_batches = 0
     
     for batch in tqdm(loader, desc=f"[{split}]", leave=False):
-        user_ids = batch['user_id'].to(device)  # [B]
-        input_ids = batch['input_ids'].to(device)   # [B, T]
-        attention_mask = batch['attention_mask'].to(device) # [B, T]
+        user_ids = batch['user_id'].to(device, non_blocking=True)  # [B]
+        input_ids = batch['input_ids'].to(device, non_blocking=True)   # [B, T]
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True) # [B, T]
         target_items = batch['target_item'].squeeze(-1).tolist()   # List[int]
         
         num_user = input_ids.size(0)
         
         # Beam Search: 生成候选语义ID
+        decode_start = time.perf_counter()
         beams = generate_beam_constrained(
             model=model,
             input_ids=input_ids,
             attention_mask=attention_mask,
             user_ids=user_ids,
             beam_size=beam_size,
-            prefix_to_next=prefix_to_next
+            allowed_masks=allowed_masks,
+            next_state_tables=next_state_tables,
+            beam_schedule=resolved_beam_schedule,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
         )
+        total_decode_time += time.perf_counter() - decode_start
         
         # 转换成推荐列表
+        candidate_start = time.perf_counter()
         all_candidates = beam_to_candidate(beams, sid2item, code_offset=code_offset)
         total_empty_candidates += sum(1 for candidates in all_candidates if len(candidates) == 0)
         total_candidate_count += sum(len(candidates) for candidates in all_candidates)
+        total_candidate_time += time.perf_counter() - candidate_start
         
         # 逐用户计算指标并累计
+        metric_start = time.perf_counter()
         for u in range(num_user):
             user_metrics = calculate_metrics(
                 recommended=all_candidates[u],
@@ -296,6 +456,8 @@ def evaluate(
 
                     hit_samples_printed += 1
         total_num_users += num_user
+        total_metric_time += time.perf_counter() - metric_start
+        num_batches += 1
     
     # 取均值
     for key in total_metrics:
@@ -303,7 +465,15 @@ def evaluate(
 
     empty_ratio = total_empty_candidates / max(total_num_users, 1)
     avg_candidate_num = total_candidate_count / max(total_num_users, 1)
+    avg_decode_time_per_batch = total_decode_time / max(num_batches, 1)
+    avg_decode_time_per_user = total_decode_time / max(total_num_users, 1)
     print(f"[{split}] empty_candidate_ratio={empty_ratio:.4f}, avg_candidate_num={avg_candidate_num:.2f}")
+    print(
+        f"[{split}] timing decode={total_decode_time:.2f}s "
+        f"candidate={total_candidate_time:.2f}s metric={total_metric_time:.2f}s "
+        f"avg_decode_per_batch={avg_decode_time_per_batch:.3f}s "
+        f"avg_decode_per_user={avg_decode_time_per_user:.6f}s"
+    )
     
     return total_metrics
 
@@ -313,7 +483,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--split', type=str, default='test', choices=['val', 'test'])
-    parser.add_argument('--beam_size', type=int, default=20)
+    parser.add_argument('--beam_size', type=int, default=None)
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--num_workers', type=int, default=None)
     parser.add_argument('--print_hit_samples', type=int, default=0,
@@ -353,6 +523,7 @@ def main():
     # Build DataLoader
     eval_batch_size = args.batch_size if args.batch_size is not None else config['batch_size']
     eval_num_workers = args.num_workers if args.num_workers is not None else config['num_workers']
+    eval_beam_size = args.beam_size if args.beam_size is not None else config.get('beam_size', 20)
 
     _, val_loader, test_loader, vocab_size = get_rec_loaders(
         data=data,
@@ -391,8 +562,13 @@ def main():
         loader=loader,
         sid2item=sid2item,
         topk=config['topk'],
-        beam_size=args.beam_size,
+        beam_size=eval_beam_size,
         device=device,
+        beam_schedule=(
+            config.get('beam_schedule')
+            if eval_beam_size == config.get('beam_size', eval_beam_size)
+            else None
+        ),
         split=args.split.capitalize(),
         print_hit_samples=args.print_hit_samples
     )

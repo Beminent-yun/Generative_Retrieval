@@ -1,6 +1,7 @@
 from tqdm.auto import tqdm
 import os
 import pickle
+import argparse
 from pathlib import Path
 from Amazon_Dataset import ItemEmbeddingDataset, get_rqvae_loaders
 from models.RQVAE import RQVAE
@@ -10,7 +11,6 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 from typing import Tuple, List, Dict
-import swanlab
 
 
 CONFIG = {
@@ -21,13 +21,14 @@ CONFIG = {
     "resume":         False,
     "save_every":     1,
     'sid_path':       "datasets/processed/semantic_ids.npy",
+    "use_swanlab":    True,
     
     # 模型
     "input_dim":      384,    # Sentence-BERT 输出维度
     "hidden_dim":     256,
     "latent_dim":     64,
     "codebook_size":  256,
-    "num_rq_layers":  3,
+    "num_rq_layers":  4,
     "decay":          0.99,
     "commitment_weight": 0.10,
     "dropout":        0.1,
@@ -37,6 +38,7 @@ CONFIG = {
     "epochs":         100,
     "lr":             3e-4,
     "weight_decay":   1e-4,
+    "usage_weight":   1e-3,
     "val_ratio":      0.1,
     "patience":       10,     # 早停：val loss 不下降多少 epoch 就停
     "min_delta":      1e-4,
@@ -46,6 +48,22 @@ CONFIG = {
     "num_workers":    os.cpu_count(),
     "seed":           42,
 }
+
+
+def _to_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off", ""}:
+            return False
+    return default
 
 
 def reconstruction_loss(x_recon: torch.tensor, x:torch.tensor)->torch.tensor:
@@ -64,21 +82,43 @@ def reconstruction_loss(x_recon: torch.tensor, x:torch.tensor)->torch.tensor:
 
 def total_loss(x_recon:torch.tensor,
                x:torch.tensor,
-               vq_loss:torch.tensor, 
-               recon_weight:float = 1.0) -> Tuple[torch.tensor, dict]:
+               vq_loss:torch.tensor,
+               usage_penalty: torch.tensor,
+               recon_weight:float = 1.0,
+               usage_weight: float = 1e-3) -> Tuple[torch.tensor, dict]:
     """
     总损失 = 重建损失 + 量化损失
     
     返回 loss 和各分量的 dict（用于日志）
     """
     recon_loss = reconstruction_loss(x_recon, x).mean()
-    total_loss = recon_weight*recon_loss + vq_loss
+    total_loss = recon_weight*recon_loss + vq_loss + usage_weight * usage_penalty
     
     return total_loss, {
         "loss": total_loss.item(),
         "recon_loss": recon_loss.item(),
-        "vq_loss": vq_loss.item()
+        "vq_loss": vq_loss.item(),
+        "usage_penalty": usage_penalty.item(),
     }
+
+
+def code_usage_penalty(model: RQVAE, codebook_size: int) -> torch.Tensor:
+    """
+    轻量 usage 正则。
+    优先使用量化器缓存的 soft usage 分布，避免对离散 code 的无梯度约束。
+    """
+    soft_usages = getattr(model.rq, "last_soft_usage_per_layer", None)
+    if not soft_usages:
+        return next(model.parameters()).new_zeros(())
+
+    penalties = []
+    log_k = float(np.log(codebook_size))
+    for usage in soft_usages:
+        probs = usage.clamp_min(1e-12)
+        entropy = -(probs * probs.log()).sum()
+        penalties.append(1.0 - entropy / log_k)
+
+    return torch.stack(penalties).mean()
     
     
 def extract_embedding(
@@ -125,7 +165,9 @@ def train_one_epoch(
     model: RQVAE,
     loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    device
+    device,
+    codebook_size: int,
+    usage_weight: float,
 )->dict:
     """
     训练一个epoch
@@ -136,7 +178,8 @@ def train_one_epoch(
     total_metrics = {
         "loss": 0.,
         "recon_loss": 0.,
-        "vq_loss": 0.
+        "vq_loss": 0.,
+        "usage_penalty": 0.,
     }
     
     for batch in loader:
@@ -144,9 +187,16 @@ def train_one_epoch(
         
         # forward
         x_recon, vq_loss, codes = model(x)
+        usage_penalty = code_usage_penalty(model, codebook_size)
         
         # Calculate Loss
-        loss, metrics = total_loss(x_recon, x, vq_loss)
+        loss, metrics = total_loss(
+            x_recon,
+            x,
+            vq_loss,
+            usage_penalty,
+            usage_weight=usage_weight,
+        )
         
         # Backward
         optimizer.zero_grad()
@@ -168,7 +218,9 @@ def train_one_epoch(
 @torch.inference_mode()
 def validation(model:RQVAE,
              loader: torch.utils.data.DataLoader,
-             device) -> dict:
+             device,
+             codebook_size: int,
+             usage_weight: float) -> dict:
     """
     验证集评估
     额外计算：码本利用率 + 语义ID碰撞率
@@ -178,31 +230,59 @@ def validation(model:RQVAE,
     total_metrics = {
         'loss':0.,
         'recon_loss':0.,
-        'vq_loss':0.
-        }
+        'vq_loss':0.,
+        'usage_penalty': 0.,
+    }
     all_codes = []  # 收集所有codes，用于计算碰撞率
+    perplexity_sums = None
     
     for batch in loader:
         x = batch.to(device)
         x_recon, vq_loss, codes = model(x)
-        loss, metrics = total_loss(x_recon, x, vq_loss)
+        usage_penalty = code_usage_penalty(model, codebook_size)
+        loss, metrics = total_loss(
+            x_recon,
+            x,
+            vq_loss,
+            usage_penalty,
+            usage_weight=usage_weight,
+        )
         
         for k, v in metrics.items():
             total_metrics[k] += float(v)/len(loader)
         
         all_codes.append(codes.cpu().numpy())
+        batch_perplexities = getattr(model.rq, "last_perplexity_per_layer", [])
+        if batch_perplexities:
+            if perplexity_sums is None:
+                perplexity_sums = np.zeros(len(batch_perplexities), dtype=np.float64)
+            perplexity_sums += np.asarray(batch_perplexities, dtype=np.float64) / len(loader)
     
     # 计算碰撞率
     all_codes = np.concatenate(all_codes, axis=0)   # [N, num_layers]
-    unique_ids = len(set(map(tuple, all_codes.tolist())))
+    full_counter = {}
+    for key in map(tuple, all_codes.tolist()):
+        full_counter[key] = full_counter.get(key, 0) + 1
+    unique_ids = len(full_counter)
     total_ids = len(all_codes)
     collision_rate = 1 - unique_ids / total_ids
+    max_dup_group = max(full_counter.values())
     
     # 码本利用率
     utilizations = model.rq.utilization_per_layer
     
     total_metrics['collision_rate'] = collision_rate
-    total_metrics['utilization'] = np.mean(utilizations)
+    total_metrics['utilization'] = float(np.mean(utilizations))
+    total_metrics['utilization_mean'] = float(np.mean(utilizations))
+    total_metrics['max_dup_group'] = float(max_dup_group)
+    for i, util in enumerate(utilizations):
+        total_metrics[f'layer{i}_utilization'] = float(util)
+    if perplexity_sums is not None:
+        for i, perplexity in enumerate(perplexity_sums):
+            total_metrics[f'layer{i}_perplexity'] = float(perplexity)
+    for k in range(1, all_codes.shape[1] + 1):
+        prefix_unique = len(set(map(tuple, all_codes[:, :k].tolist())))
+        total_metrics[f'prefix_collision@{k}'] = 1 - prefix_unique / total_ids
     
     return total_metrics
 
@@ -296,11 +376,14 @@ def kmeans_init_codebooks(
         # 写入码本
         with torch.inference_mode():
             quantizer.codebook.copy_(centers)
-            quantizer.ema_weight.copy_(centers)
             count = torch.FloatTensor(
                 np.bincount(km.labels_, minlength=K).astype(np.float32)
             ).to(device)
-            quantizer.ema_count.copy_(count.clamp(min=1))
+            count = count.clamp(min=1)
+            quantizer.ema_count.copy_(count)
+            # EMA 量化器内部将 ema_weight 视为“分配向量和”而不是“中心点本身”
+            # 所以 KMeans 初始化时需要写入 centers * count，避免首轮更新把码本错误缩小。
+            quantizer.ema_weight.copy_(centers * count.unsqueeze(1))
 
         # 计算残差
         labels = km.labels_
@@ -319,9 +402,19 @@ def train_rqvae(config:dict = CONFIG):
     device = config['device']
     output_dir = Path(config['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
+    use_swanlab = _to_bool(config.get('use_swanlab', True), default=True)
+    swanlab = None
 
     # 初始化 SwanLab 记录
-    swanlab.init(project="rqvae", name=f"train-rqvae-lr={config['lr']}-cw={config['commitment_weight']}", config=config)
+    if use_swanlab:
+        import swanlab
+        swanlab.init(
+            project="rqvae",
+            name=f"train-rqvae-lr={config['lr']}-cw={config['commitment_weight']}",
+            config=config
+        )
+    else:
+        print("SwanLab logging disabled.")
     
     print(f"Using device: {device}")
     
@@ -374,6 +467,7 @@ def train_rqvae(config:dict = CONFIG):
     
     # Early Stopping
     best_val_loss = float('inf')
+    best_collision_rate = float('inf')
     patience_counter = 0
     min_delta = config.get('min_delta', 0.0)
     best_model_path = output_dir/'best_model.pt'
@@ -386,20 +480,37 @@ def train_rqvae(config:dict = CONFIG):
         optimizer.load_state_dict(latest['optimizer_state'])
         scheduler.load_state_dict(latest['scheduler_state'])
         best_val_loss = latest.get('best_val_loss', best_val_loss)
+        best_collision_rate = latest.get('best_collision_rate', best_collision_rate)
         patience_counter = latest.get('patience_counter', patience_counter)
         start_epoch = latest.get('epoch', 0) + 1
         print(f"Resume from {latest_model_path} (epoch {start_epoch-1})")
+
+    def save_latest_checkpoint(epoch: int):
+        torch.save({
+            'epoch': epoch,
+            'model_state': model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'scheduler_state': scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'best_collision_rate': best_collision_rate,
+            'patience_counter': patience_counter,
+            'config': config,
+        }, latest_model_path)
     
     for epoch in range(start_epoch, config['epochs'] + 1):
         # Train
         train_metrics = train_one_epoch(model,
                                         train_loader,
                                         optimizer,
-                                        device)
+                                        device,
+                                        codebook_size=config['codebook_size'],
+                                        usage_weight=config['usage_weight'])
         # Validation
         val_metrics = validation(model,
                                  val_loader,
-                                 device)
+                                 device,
+                                 codebook_size=config['codebook_size'],
+                                 usage_weight=config['usage_weight'])
         scheduler.step()
         
         # printing log
@@ -407,45 +518,61 @@ def train_rqvae(config:dict = CONFIG):
             f"Epoch {epoch:3d}/{config['epochs']} | "
             f"train_loss={train_metrics['loss']:.4f} "
             f"recon={train_metrics['recon_loss']:.4f} "
-            f"vq={train_metrics['vq_loss']:.4f} | "
+            f"vq={train_metrics['vq_loss']:.4f} "
+            f"usage={train_metrics['usage_penalty']:.4f} | "
             f"val_loss={val_metrics['loss']:.4f} "
             f"collision={val_metrics['collision_rate']:.2%} "
-            f"util={val_metrics['utilization']:.1%}"
+            f"util={val_metrics['utilization_mean']:.1%}"
         )
 
         # 记录指标到 SwanLab
         current_lr = optimizer.param_groups[0]['lr']
-        swanlab.log({
-            "train/loss": train_metrics['loss'],
-            "train/recon": train_metrics['recon_loss'],
-            "train/vq": train_metrics['vq_loss'],
-            "val/loss": val_metrics['loss'],
-            "val/collision_rate": val_metrics['collision_rate'],
-            "val/utilization": val_metrics['utilization'],
-            "lr": current_lr,
-        }, step=epoch)
+        if use_swanlab:
+            swanlab.log({
+                "train/loss": train_metrics['loss'],
+                "train/recon": train_metrics['recon_loss'],
+                "train/vq": train_metrics['vq_loss'],
+                "train/usage_penalty": train_metrics['usage_penalty'],
+                "val/loss": val_metrics['loss'],
+                "val/recon": val_metrics['recon_loss'],
+                "val/vq": val_metrics['vq_loss'],
+                "val/usage_penalty": val_metrics['usage_penalty'],
+                "val/collision_rate": val_metrics['collision_rate'],
+                "val/utilization": val_metrics['utilization_mean'],
+                "val/max_dup_group": val_metrics['max_dup_group'],
+                "lr": current_lr,
+            }, step=epoch)
+            for i in range(config['num_rq_layers']):
+                swanlab.log({
+                    f"val/layer{i}_utilization": val_metrics.get(f'layer{i}_utilization', 0.0),
+                    f"val/layer{i}_perplexity": val_metrics.get(f'layer{i}_perplexity', 0.0),
+                    f"val/prefix_collision@{i+1}": val_metrics.get(f'prefix_collision@{i+1}', 0.0),
+                }, step=epoch)
         
         # Check early stopping
-        if val_metrics['loss'] < (best_val_loss - min_delta):
+        current_collision = val_metrics['collision_rate']
+        is_better_collision = current_collision < (best_collision_rate - 1e-8)
+        is_tie_better_loss = (
+            abs(current_collision - best_collision_rate) <= 1e-8
+            and val_metrics['loss'] < (best_val_loss - min_delta)
+        )
+        if is_better_collision:
+            best_collision_rate = current_collision
             best_val_loss = val_metrics['loss']
             patience_counter = 0
             torch.save(model.state_dict(), best_model_path)
+        elif is_tie_better_loss:
+            best_val_loss = val_metrics['loss']
+            torch.save(model.state_dict(), best_model_path)
         else:
             patience_counter += 1
-            if patience_counter >= config['patience']:
-                print(f"\n早停：val_loss 连续 {config['patience']} epoch 不下降")
-                break
 
-        if (epoch % config.get('save_every', 1)) == 0:
-            torch.save({
-                'epoch': epoch,
-                'model_state': model.state_dict(),
-                'optimizer_state': optimizer.state_dict(),
-                'scheduler_state': scheduler.state_dict(),
-                'best_val_loss': best_val_loss,
-                'patience_counter': patience_counter,
-                'config': config,
-            }, latest_model_path)
+        # 每个 epoch 都保存 latest，保证可随时 resume 到最近状态
+        save_latest_checkpoint(epoch)
+
+        if patience_counter >= config['patience']:
+            print(f"\n早停：collision_rate 连续 {config['patience']} epoch 不下降")
+            break
         
     print("Generating Semantic IDs")
     model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=False))
@@ -461,6 +588,39 @@ def train_rqvae(config:dict = CONFIG):
     print("\n✅ RQ-VAE 训练完成！")
     return model, semantic_ids
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train RQ-VAE")
+    parser.add_argument("--use_swanlab", type=str, default=None,
+                        help="Whether to enable swanlab logging (true/false)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Whether to resume from latest checkpoint (true/false)")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Training batch size")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Learning rate")
+    return parser.parse_args()
+
+
+def build_config_from_args(base_config: dict, args) -> dict:
+    config = dict(base_config)
+    if args.use_swanlab is not None:
+        config['use_swanlab'] = _to_bool(args.use_swanlab, default=config.get('use_swanlab', True))
+    if args.resume is not None:
+        config['resume'] = _to_bool(args.resume, default=config.get('resume', False))
+    if args.epochs is not None:
+        config['epochs'] = args.epochs
+    if args.batch_size is not None:
+        config['batch_size'] = args.batch_size
+    if args.lr is not None:
+        config['lr'] = args.lr
+    return config
+
     
 if __name__ == "__main__":
-    train_rqvae()
+    args = parse_args()
+    run_config = build_config_from_args(CONFIG, args)
+    print(f"use_swanlab = {run_config['use_swanlab']}")
+    train_rqvae(run_config)

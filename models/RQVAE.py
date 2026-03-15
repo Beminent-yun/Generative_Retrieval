@@ -27,6 +27,7 @@ class VectorQuantizerEMA(nn.Module):
         self.register_buffer("codebook", codebook.clone())
         self.register_buffer("ema_weight", codebook.clone())
         self.register_buffer("ema_count", torch.ones(codebook_size))
+        self.last_soft_usage: torch.Tensor | None = None
 
     def _compute_distances(self, inputs: torch.Tensor) -> torch.Tensor:
         return (
@@ -35,7 +36,7 @@ class VectorQuantizerEMA(nn.Module):
             - 2.0 * inputs @ self.codebook.t()
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _ema_update(self, inputs: torch.Tensor, encodings: torch.Tensor) -> None:
         batch_count = encodings.sum(dim=0)
         batch_weight = encodings.transpose(0, 1) @ inputs
@@ -54,6 +55,16 @@ class VectorQuantizerEMA(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         distances = self._compute_distances(inputs)
+        detached_codebook = self.codebook.detach().clone()
+        soft_distances = (
+            inputs.pow(2).sum(dim=1, keepdim=True)
+            + detached_codebook.pow(2).sum(dim=1).unsqueeze(0)
+            - 2.0 * inputs @ detached_codebook.t()
+        )
+        soft_probs = torch.softmax(
+            -soft_distances / max(self.embedding_dim ** 0.5, 1.0), dim=1
+        )
+        self.last_soft_usage = soft_probs.mean(dim=0)
         codes = torch.argmin(distances, dim=1)
         encodings = F.one_hot(codes, num_classes=self.codebook_size).type_as(inputs)
         quantized = F.embedding(codes, self.codebook)
@@ -99,6 +110,7 @@ class ResidualVectorQuantizer(nn.Module):
         self.last_codes: torch.Tensor | None = None
         self.last_avg_residual_norm_per_layer: List[float] = []
         self.last_perplexity_per_layer: List[float] = []
+        self.last_soft_usage_per_layer: List[torch.Tensor] = []
 
     def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = inputs
@@ -108,6 +120,7 @@ class ResidualVectorQuantizer(nn.Module):
         codes_per_layer = []
         residual_norms = []
         perplexities = []
+        soft_usages = []
 
         for quantizer in self.quantizers:
             quantized, codes = quantizer(residual)
@@ -127,6 +140,8 @@ class ResidualVectorQuantizer(nn.Module):
                 -(probs * (probs + 1e-12).log()).sum()
             )
             perplexities.append(float(perplexity.item()))
+            if quantizer.last_soft_usage is not None:
+                soft_usages.append(quantizer.last_soft_usage)
 
         codes_tensor = torch.stack(codes_per_layer, dim=1)
         quantized_st = inputs + (quantized_sum - inputs).detach()
@@ -134,6 +149,7 @@ class ResidualVectorQuantizer(nn.Module):
         self.last_codes = codes_tensor.detach()
         self.last_avg_residual_norm_per_layer = residual_norms
         self.last_perplexity_per_layer = perplexities
+        self.last_soft_usage_per_layer = soft_usages
 
         return quantized_st, total_vq_loss, codes_tensor
 

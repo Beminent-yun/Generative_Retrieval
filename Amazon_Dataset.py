@@ -79,8 +79,11 @@ class SeqTrainDataset(Dataset):
                  max_seq_len:int = 50,  # 用户历史行为序列的最大长度（item数）
                  num_rq_layers:int = 3,     # 每个item对应几个token/code
                  use_sliding_window: bool = True,
+                 sliding_window_mode: str = "all",
                  window_size:int = 20,  # 历史窗口最大长度
                  min_seq_len: int = 2,  # 历史序列的最小长度
+                 windows_per_user: int = 2,
+                 seed: int = 42,
                  ):    
         if semantic_ids.ndim != 2:
             raise ValueError(f"semantic_ids must be 2D [num_items, num_rq_layers], got shape={semantic_ids.shape}")
@@ -95,6 +98,12 @@ class SeqTrainDataset(Dataset):
             raise ValueError(f"min_seq_len must be >= 1, got {min_seq_len}")
         if window_size < 1:
             raise ValueError(f"window_size must be >= 1, got {window_size}")
+        if sliding_window_mode not in {"all", "sample_per_epoch"}:
+            raise ValueError(
+                f"sliding_window_mode must be 'all' or 'sample_per_epoch', got {sliding_window_mode}"
+            )
+        if windows_per_user < 1:
+            raise ValueError(f"windows_per_user must be >= 1, got {windows_per_user}")
 
         self.user_histories = user_histories
         self.targets = targets
@@ -106,13 +115,25 @@ class SeqTrainDataset(Dataset):
         self.max_tokens = 1 + max_seq_len * num_rq_layers
         
         self.use_sliding_window = use_sliding_window
+        self.sliding_window_mode = sliding_window_mode
         self.window_size = window_size
         self.min_seq_len = min_seq_len
+        self.windows_per_user = windows_per_user
+        self.seed = seed
         
         # 构建样本列表
-        self.samples = self._build_samples()
+        self.samples: List[tuple[int, List[int], int]] = []
+        self.resample_samples(epoch=0)
+
+    def _build_window_candidates(self, user_id: int, history: List[int]) -> List[tuple[int, List[int], int]]:
+        candidates = []
+        for end in range(self.min_seq_len, len(history)):
+            sub_hist = history[max(0, end - self.window_size):end]
+            sub_target = history[end]
+            candidates.append((user_id, sub_hist, sub_target))
+        return candidates
         
-    def _build_samples(self):
+    def _build_samples(self, rng: np.random.RandomState | None = None):
         """
         构建所有训练样本
         
@@ -127,23 +148,44 @@ class SeqTrainDataset(Dataset):
                 continue
 
             if self.use_sliding_window:
-                # 历史太短：退化成单样本
-                if len(history) < self.min_seq_len:
-                    samples.append((user_id, history[-self.window_size:], target))
-                    continue
+                if self.sliding_window_mode == "all":
+                    # 历史太短：退化成单样本
+                    if len(history) < self.min_seq_len:
+                        samples.append((user_id, history[-self.window_size:], target))
+                        continue
 
-                # 历史内部切窗：用 history[:end] 预测 history[end]
-                for end in range(self.min_seq_len, len(history)):
-                    sub_hist = history[max(0, end - self.window_size):end]
-                    sub_target = history[end]
-                    samples.append((user_id, sub_hist, sub_target))
+                    samples.extend(self._build_window_candidates(user_id, history))
+                else:
+                    window_candidates = self._build_window_candidates(user_id, history)
+                    if len(window_candidates) <= self.windows_per_user:
+                        samples.extend(window_candidates)
+                    elif rng is not None:
+                        chosen_idx = rng.choice(
+                            len(window_candidates),
+                            size=self.windows_per_user,
+                            replace=False
+                        )
+                        for idx in sorted(chosen_idx.tolist()):
+                            samples.append(window_candidates[idx])
+                    else:
+                        samples.extend(window_candidates[:self.windows_per_user])
 
-                # 再补一个“真实训练目标”样本（history -> target）
+                # 始终保留一个“真实训练目标”样本（history -> final target）
                 samples.append((user_id, history[-self.window_size:], target))
             else:
                 samples.append((user_id, history[-self.window_size:], target))
 
         return samples
+
+    def resample_samples(self, epoch: int):
+        """
+        每个 epoch 固定重采样一次窗口，保证增强可复现。
+        """
+        if self.use_sliding_window and self.sliding_window_mode == "sample_per_epoch":
+            rng = np.random.RandomState(self.seed + epoch)
+            self.samples = self._build_samples(rng=rng)
+        else:
+            self.samples = self._build_samples()
     
     def _item_to_tokens(self, item_id:int) -> List[int]:
         """
@@ -294,8 +336,11 @@ def get_rec_loaders(
     num_rq_layers: int = 3,
     num_workers: int = 2,
     use_sliding_window: bool = True,
+    sliding_window_mode: str = "all",
     window_size: int = 20,
     min_seq_len: int = 2,
+    windows_per_user: int = 2,
+    seed: int = 42,
 ):
     """
     推荐模型的 DataLoader
@@ -332,8 +377,11 @@ def get_rec_loaders(
         user_histories=train_histories,
         targets=train_targets,
         use_sliding_window=use_sliding_window,
+        sliding_window_mode=sliding_window_mode,
         window_size=window_size, # 历史窗口大小
         min_seq_len=min_seq_len,  # 最短历史长度 -> 至少需要2个item历史才能生成样本
+        windows_per_user=windows_per_user,
+        seed=seed,
         **common_kwargs
     )
     # val验证集：历史=train序列，目标=val target

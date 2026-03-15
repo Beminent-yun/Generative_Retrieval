@@ -76,25 +76,35 @@ def beam_to_candidate(
         - List[List[int]], 外层->用户，内层->推荐列表（按beam search结果排序）
     """
     num_user, beam_size, L = beams.shape
+
+    # 避免在 Python 循环里频繁 .item() 触发 GPU 同步。
+    raw_codes = beams.detach().to("cpu", copy=False).numpy() - code_offset
+    flat_codes = raw_codes.reshape(num_user * beam_size, L)
+
+    # 批内相同 SID 只查一次表，减少重复 dict lookup。
+    sid_lookup_cache: Dict[tuple, List[int]] = {}
+    flat_items: List[List[int]] = []
+    for row in flat_codes.tolist():
+        sid = tuple(row)
+        if sid not in sid_lookup_cache:
+            sid_lookup_cache[sid] = sid2item.get(sid, [])
+        flat_items.append(sid_lookup_cache[sid])
+
     all_candidates = []
-    
-    for u in range(num_user):
+    for user_idx in range(num_user):
         candidates = []
         seen = set()
-        
-        for beam_idx in range(beam_size):
-            # token ID -> raw code
-            raw_codes = tuple(
-                beams[u, beam_idx, l].item() - code_offset for l in range(L)
-            )
-            # 查表
-            items = sid2item.get(raw_codes, [])
+        start = user_idx * beam_size
+        end = start + beam_size
+
+        for items in flat_items[start:end]:
             for item in items:
                 if item not in seen:
                     candidates.append(item)
                     seen.add(item)
+
         all_candidates.append(candidates)
-    
+
     return all_candidates
 
 
@@ -118,15 +128,16 @@ def build_prefix_to_next_tokens(
     return {k: sorted(v) for k, v in prefix_to_next.items()}
 
 
-def build_prefix_constraint_tables(
+def build_prefix_branch_tables(
     sid2item: Dict[tuple, List[int]],
     vocab_size: int,
     code_offset: int = 3
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     """
     构建逐层前缀约束表：
-    - allowed_masks[step][state, token] -> 当前前缀状态下该 token 是否可扩展
-    - next_state_tables[step][state, token] -> 选择 token 后进入的下一层前缀状态
+    - allowed_masks[step][state, token] -> 当前前缀状态下第 branch 个可选 token
+    - next_state_tables[step][state, token] -> 选择 token 后进入的下一层前缀状态, 最后一步填-1
+    - branch_masks[step][state, branch] -> 该 branch 是否有效
     """
     raw_sids = list(sid2item.keys())
     if not raw_sids:
@@ -148,38 +159,44 @@ def build_prefix_constraint_tables(
 
     allowed_masks = []
     next_state_tables = []
+    branch_masks = []
 
     for depth in range(num_rq_layers):
         state_map = prefix_state_maps[depth]
-        allowed_mask = torch.zeros((len(state_map), vocab_size), dtype=torch.bool)
-
-        if depth < num_rq_layers - 1:
-            next_state_table = torch.full((len(state_map), vocab_size), -1, dtype=torch.long)
-            next_state_map = prefix_state_maps[depth + 1]
-        else:
-            next_state_table = torch.empty((0, 0), dtype=torch.long)
-            next_state_map = None
+        next_state_map = prefix_state_maps[depth + 1] if depth < num_rq_layers - 1 else None
+        
+        max_branch = max(len(children) for children in prefix_children_by_depth[depth].values())
+        token_table = torch.full((len(state_map), max_branch), -1, dtype=torch.long)
+        next_state_table = torch.full((len(state_map), max_branch), -1, dtype=torch.long)
+        branch_mask = torch.zeros((len(state_map), max_branch), dtype=torch.bool)
 
         for prefix, row_idx in state_map.items():
-            for token in sorted(prefix_children_by_depth[depth][prefix]):
-                allowed_mask[row_idx, token] = True
+            children = sorted(prefix_children_by_depth[depth][prefix])
+            for branch_idx, token in enumerate(children):
+                token_table[row_idx, branch_idx] = token
+                branch_mask[row_idx, branch_idx] = True
                 if next_state_map is not None:
-                    next_state_table[row_idx, token] = next_state_map[prefix + (token,)]
-
-        allowed_masks.append(allowed_mask)
+                    next_state_table[row_idx, branch_idx] = next_state_map[prefix + (token,)]
+                
+            
+        allowed_masks.append(token_table)
         next_state_tables.append(next_state_table)
+        branch_masks.append(branch_mask)
 
-    return allowed_masks, next_state_tables
+    return allowed_masks, next_state_tables, branch_masks
 
 
-def move_constraint_tables_to_device(
-    allowed_masks: list[torch.Tensor],
+
+def move_branch_tables_to_device(
+    allowed_tokens: list[torch.Tensor],
     next_state_tables: list[torch.Tensor],
+    branch_masks:list[torch.Tensor],
     device: torch.device
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     return (
-        [mask.to(device, non_blocking=True) for mask in allowed_masks],
-        [table.to(device, non_blocking=True) for table in next_state_tables]
+        [table.to(device, non_blocking=True) for table in allowed_tokens],
+        [table.to(device, non_blocking=True) for table in next_state_tables],
+        [mask.to(device, non_blocking=True) for mask in branch_masks]
     )
 
 
@@ -236,12 +253,13 @@ def resolve_eval_amp_settings(device: str) -> tuple[bool, torch.dtype | None]:
 @torch.inference_mode()
 def generate_beam_constrained(
     model: CausalTransformer,
-    input_ids: torch.tensor,
-    attention_mask: torch.tensor,
-    user_ids: torch.tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    user_ids: torch.Tensor,
     beam_size: int,
-    allowed_masks: list[torch.tensor],
-    next_state_tables: list[torch.tensor],
+    allowed_tokens: list[torch.Tensor],
+    next_states: list[torch.Tensor],
+    branch_masks:list[torch.Tensor],
     beam_schedule: List[int] | None = None,
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
@@ -285,34 +303,50 @@ def generate_beam_constrained(
                 prefix_ids=prefixes_flat
             )
 
-        log_prob = torch.log_softmax(logits.float(), dim=-1)
         state_ids = beam_states.reshape(-1)
-        allowed_mask = allowed_masks[step].index_select(0, state_ids)
-        masked_log_prob = log_prob.masked_fill(~allowed_mask, float('-inf'))
 
-        masked_log_prob = masked_log_prob.view(B, curr_beam, V)
-        total_scores = beam_scores.unsqueeze(-1) + masked_log_prob
-        flat_scores = total_scores.view(B, curr_beam * V)
+        step_tokens = allowed_tokens[step].index_select(0, state_ids)          # [B*beam, max_branch]
+        step_branch_mask = branch_masks[step].index_select(0, state_ids)       # [B*beam, max_branch]
+        step_tokens_safe = step_tokens.clamp_min(0)
+
+        # 基于 full-vocab 的 logsumexp 做归一化
+        logits_f = logits.float()
+        log_norm = torch.logsumexp(logits_f, dim=-1, keepdim=True)             # [B*beam, 1]
+        branch_logits = logits_f.gather(1, step_tokens_safe)                   # [B*beam, max_branch]
+        branch_log_prob = branch_logits - log_norm
+        branch_log_prob = branch_log_prob.masked_fill(~step_branch_mask, float("-inf"))
+
+        max_branch = step_tokens.size(1)
+        branch_log_prob = branch_log_prob.view(B, curr_beam, max_branch)
+        step_tokens = step_tokens.view(B, curr_beam, max_branch)
+
+        total_scores = beam_scores.unsqueeze(-1) + branch_log_prob
+        flat_scores = total_scores.view(B, curr_beam * max_branch)
 
         step_beam_size = resolved_beam_schedule[step]
         k = min(step_beam_size, flat_scores.size(1))
         new_scores, new_pos = torch.topk(flat_scores, k, dim=-1)
-        parent_idx = new_pos // V
-        token_idx = new_pos % V
+
+        parent_idx = new_pos // max_branch
+        branch_idx = new_pos % max_branch
 
         new_beams = beams.gather(1, parent_idx.unsqueeze(-1).expand(-1, -1, L))
+        selected_tokens = step_tokens.gather(1, parent_idx.unsqueeze(-1).expand(-1, -1, max_branch))
+        token_idx = selected_tokens.gather(2, branch_idx.unsqueeze(-1)).squeeze(-1)
         new_beams[:, :, step] = token_idx
 
         beams = new_beams
         beam_scores = new_scores
 
         if step < L - 1:
-            parent_states = beam_states.gather(1, parent_idx)
-            next_states = next_state_tables[step][
-                parent_states.reshape(-1),
-                token_idx.reshape(-1)
-            ].view(B, k)
-            beam_states = next_states
+            step_next_states = next_states[step].index_select(0, state_ids).view(B, curr_beam, max_branch)
+            selected_next_states = step_next_states.gather(
+                1, parent_idx.unsqueeze(-1).expand(-1, -1, max_branch)
+            )
+            beam_states = selected_next_states.gather(
+                2, branch_idx.unsqueeze(-1)
+            ).squeeze(-1)
+
 
     return beams
 
@@ -358,16 +392,17 @@ def evaluate(
     )
 
     code_offset = model.CODE_OFFSET
-    allowed_masks, next_state_tables = build_prefix_constraint_tables(
+    allowed_tokens, next_states, branch_masks = build_prefix_branch_tables(
         sid2item,
-        vocab_size=model.vocab_size,
         code_offset=code_offset
     )
-    allowed_masks, next_state_tables = move_constraint_tables_to_device(
-        allowed_masks,
-        next_state_tables,
+    allowed_tokens, next_states, branch_masks = move_branch_tables_to_device(
+        allowed_tokens,
+        next_states,
+        branch_masks,
         torch.device(device)
     )
+
     
     model.eval()
     
@@ -399,12 +434,14 @@ def evaluate(
             attention_mask=attention_mask,
             user_ids=user_ids,
             beam_size=beam_size,
-            allowed_masks=allowed_masks,
-            next_state_tables=next_state_tables,
+            allowed_tokens=allowed_tokens,
+            next_states=next_states,
+            branch_masks=branch_masks,
             beam_schedule=resolved_beam_schedule,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
         )
+
         total_decode_time += time.perf_counter() - decode_start
         
         # 转换成推荐列表

@@ -194,6 +194,11 @@ def train_one_epoch(
     return total_loss / num_batches, total_acc / num_batches
 
 
+def build_timestamped_ckpt_path(output_dir: Path, prefix: str, epoch: int) -> Path:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return output_dir / f"{prefix}_epoch{epoch:03d}_{timestamp}.pt"
+
+
 def train_rec(config:dict = CONFIG):
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
@@ -410,16 +415,20 @@ def train_rec(config:dict = CONFIG):
             if val_ndcg > best_val_ndcg:
                 best_val_ndcg = val_ndcg
                 patience_count = 0
-                
-                torch.save({
+
+                best_state = {
                     'epoch': epoch,
                     'model_state': model.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
                     'scaler_state': scaler.state_dict() if scaler.is_enabled() else None,
                     'val_metrics': val_metrics,
                     'config': config
-                }, best_ckpt_path)
+                }
+                torch.save(best_state, best_ckpt_path)
+                best_snapshot_path = build_timestamped_ckpt_path(output_dir, "best_model", epoch)
+                torch.save(best_state, best_snapshot_path)
                 print(f"Saved Best Model(NDCG@{monitor_k})={val_ndcg:.4f}")
+                print(f"Saved best snapshot to {best_snapshot_path}")
             else:
                 patience_count += 1
                 print(f"  patience: {patience_count}/{config['patience']}")
@@ -430,7 +439,7 @@ def train_rec(config:dict = CONFIG):
 
             # 保存 latest 以便断点续训（放在早停判断后，确保状态是最新）
             if (epoch % config['save_every']) == 0:
-                torch.save({
+                latest_state = {
                     'epoch': epoch,
                     'model_state': model.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
@@ -439,8 +448,12 @@ def train_rec(config:dict = CONFIG):
                     'patience_count': patience_count,
                     'history': history,
                     'config': config
-                }, latest_ckpt_path)
+                }
+                torch.save(latest_state, latest_ckpt_path)
+                latest_snapshot_path = build_timestamped_ckpt_path(output_dir, "latest", epoch)
+                torch.save(latest_state, latest_snapshot_path)
                 print(f"Saved latest checkpoint to {latest_ckpt_path}")
+                print(f"Saved latest snapshot to {latest_snapshot_path}")
         else:
             # 非评估轮次只打印 loss
             swanlab.log({

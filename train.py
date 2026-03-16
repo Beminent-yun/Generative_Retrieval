@@ -52,9 +52,9 @@ CONFIG = {
 
     # 评估
     "beam_size":       40,
-    "beam_schedule":   [40, 20, 8, 1],
+    "beam_schedule":   [40, 40, 40, 40],
     "train_eval_beam_size": 10,
-    "train_eval_beam_schedule": [10, 5, 2, 1],
+    "train_eval_beam_schedule": [10, 10, 10, 10],
     "train_eval_topk": [1, 5, 10],
     "topk":            [1, 5, 10, 20, 40],
     
@@ -63,6 +63,44 @@ CONFIG = {
     'seed':             42
 }
 
+
+def print_parameter_summary(model:torch.nn.Module) -> None:
+    total_params = 0
+    trainable_params = 0
+    
+    print('\nParameter Summary')
+    print('-'*60)
+    
+    module_param_counts = {}
+    for name, param in model.named_parameters():
+        num_params = param.numel()
+        total_params += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+        
+        top_module = name.split('.')[0]
+        module_param_counts[top_module] = module_param_counts.get(top_module, 0) + num_params
+
+    for module_name, count in sorted(module_param_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"{module_name:20s} {count:12,d}")
+
+    print('-'*60)
+    print(f"{'total':20s} {total_params:12,d}")
+    print(f"{'trainable':20s} {trainable_params:12,d}")
+    print('-'*60)
+
+
+def warn_if_eval_beam_too_narrow(beam_schedule: list[int] | None, topk: list[int], label: str) -> None:
+    if not beam_schedule or not topk:
+        return
+
+    final_beam = beam_schedule[-1]
+    max_k = max(topk)
+    if final_beam < max_k:
+        print(
+            f"[WARN] {label} final beam width={final_beam} < max(topk)={max_k}. "
+            "Top-k metrics may be underestimated because too few final SID paths are kept."
+        )
 
 class WarmupCosineScheduler:
     """
@@ -344,6 +382,16 @@ def train_rec(config:dict = CONFIG):
     # 优先用 NDCG@10, 如果 topk 里面没有 10 就用最大的 K 
     train_eval_topk = config.get('train_eval_topk', config['topk'])
     monitor_k = 10 if 10 in train_eval_topk else max(train_eval_topk)
+    print(
+        f"Train-eval beam | size={config.get('train_eval_beam_size', config['beam_size'])} "
+        f"schedule={config.get('train_eval_beam_schedule')}"
+    )
+    print(
+        f"Test beam       | size={config['beam_size']} "
+        f"schedule={config.get('beam_schedule')}"
+    )
+    warn_if_eval_beam_too_narrow(config.get('train_eval_beam_schedule'), train_eval_topk, "train-eval")
+    warn_if_eval_beam_too_narrow(config.get('beam_schedule'), config['topk'], "test")
 
     for epoch in range(start_epoch, config['epochs'] + 1):
         # update learning rate

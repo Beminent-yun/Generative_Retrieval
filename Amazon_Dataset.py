@@ -14,12 +14,14 @@ CODE_OFFSET = 3 # RQ-VAE code的起始token ID : code 0 → token 3, code 255 �
 def code2token(code:int) -> int:
     """
     RQ-VAE 的 code 转换成 token ID
+    token = code + CODE_OFFSET
     """
     return code + CODE_OFFSET
 
 def token2code(token:int) -> int:
     """
     token ID 转换为 RQ-VAE的code
+    code = token - CODE_OFFSET
     """
     return token - CODE_OFFSET
 

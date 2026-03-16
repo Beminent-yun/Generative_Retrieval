@@ -12,6 +12,29 @@ from collections import defaultdict
 from models.Transformer import CausalTransformer
 
 
+def build_sid_to_item_tables(
+    semantic_ids:np.ndarray
+) -> tuple[Dict[tuple, int], Dict[tuple, List[int]]]:
+    """
+    将 SID -> item 拆成：
+    - sid2item_single: 大多数 1对1 SID，直接映射到单个 item_id
+    - sid2item_multi: 少数碰撞 SID, 映射到多个 item_id
+    """
+    sid_buckets = defaultdict(list)
+    for item_id, sid in enumerate(semantic_ids):
+        sid_buckets[tuple(map(int, sid))].append(item_id)
+        
+    sid2item_single = {}
+    sid2item_multi = {}
+    for sid, items in sid_buckets.items():
+        if len(items) == 1:
+            sid2item_single[sid] = items[0]
+        else:
+            sid2item_multi[sid] = items
+    
+    return sid2item_single, sid2item_multi
+
+
 def build_sid_to_item(semantic_ids:np.ndarray) -> Dict[tuple, List[int]]:
     """
     构建 Lookup Table {(c0, c1, c2): [item_id, ...]}
@@ -74,7 +97,8 @@ def print_metrics(
 
 def beam_to_candidate(
     beams: torch.Tensor,    # [batch_size, beam_size, L]
-    sid2item: Dict[tuple, List[int]],
+    sid2item_single: Dict[tuple, int],
+    sid2item_multi: Dict[tuple, List[int]],
     code_offset:int = 3
 )-> List[List[int]]:
     """
@@ -91,12 +115,17 @@ def beam_to_candidate(
     flat_codes = raw_codes.reshape(num_user * beam_size, L)
 
     # 批内相同 SID 只查一次表，减少重复 dict lookup。
-    sid_lookup_cache: Dict[tuple, List[int]] = {}
-    flat_items: List[List[int]] = []
+    sid_lookup_cache = {}
+    flat_items = []
+    
     for row in flat_codes.tolist():
         sid = tuple(row)
         if sid not in sid_lookup_cache:
-            sid_lookup_cache[sid] = sid2item.get(sid, [])
+            single_item = sid2item_single.get(sid)
+            if single_item is not None:
+                sid_lookup_cache[sid] = single_item
+            else:
+                sid_lookup_cache[sid] = sid2item_multi.get(sid, [])
         flat_items.append(sid_lookup_cache[sid])
 
     all_candidates = []
@@ -107,10 +136,15 @@ def beam_to_candidate(
         end = start + beam_size
 
         for items in flat_items[start:end]:
-            for item in items:
-                if item not in seen:
-                    candidates.append(item)
-                    seen.add(item)
+            if isinstance(items, int):
+                if items not in seen:
+                    candidates.append(items)
+                    seen.add(items)
+            else:
+                for item in items:
+                    if item not in seen:
+                        candidates.append(item)
+                        seen.add(item)
 
         all_candidates.append(candidates)
 
@@ -349,7 +383,9 @@ def resolve_eval_amp_settings(device: str) -> tuple[bool, torch.dtype | None]:
 def evaluate(
     model: CausalTransformer,
     loader: DataLoader,
-    sid2item: Dict[tuple, List[int]],
+    sid2item:Dict[tuple, List[int]],
+    sid2item_single: Dict[tuple, int],
+    sid2item_multi: Dict[tuple, List[int]],
     topk: List[int],
     beam_size:int,
     device:str,
@@ -440,7 +476,14 @@ def evaluate(
         
         # 转换成推荐列表
         candidate_start = time.perf_counter()
-        all_candidates = beam_to_candidate(beams, sid2item, code_offset=code_offset)
+        
+        all_candidates = beam_to_candidate(
+            beams, 
+            sid2item_single,
+            sid2item_multi,  
+            code_offset=code_offset
+        )
+        
         total_empty_candidates += sum(1 for candidates in all_candidates if len(candidates) == 0)
         total_candidate_count += sum(len(candidates) for candidates in all_candidates)
         total_candidate_time += time.perf_counter() - candidate_start
@@ -556,6 +599,7 @@ def main():
         target_loss_weights = [1.0] * num_rq_layers
 
     sid2item = build_sid_to_item(semantic_ids)
+    sid2item_single, sid2item_multi = build_sid_to_item_tables(semantic_ids)
     
     # Build DataLoader
     eval_batch_size = args.batch_size if args.batch_size is not None else config['batch_size']
@@ -610,6 +654,8 @@ def main():
         model=model,
         loader=loader,
         sid2item=sid2item,
+        sid2item_single=sid2item_single,
+        sid2item_multi=sid2item_multi,
         topk=eval_topk,
         beam_size=eval_beam_size,
         device=device,

@@ -424,9 +424,7 @@ def train_rec(config:dict = CONFIG):
         f"enabled={config.get('hierarchical_attention_enabled', False)} "
         f"layout={model.attention_layout}"
     )
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f'总参数量：{total_params}')
+    print_parameter_summary(model)
     
     optimizer = torch.optim.AdamW(
         model.parameters(),

@@ -645,7 +645,9 @@ def main():
         num_rq_layers=num_rq_layers,
         codebook_size=config['codebook_size'],
         use_user_token=config.get('use_user_token', True),
-        target_loss_weights=target_loss_weights
+        target_loss_weights=target_loss_weights,
+        hierarchical_attention_enabled=config.get('hierarchical_attention_enabled', False),
+        attention_layout=config.get('attention_layout')
     ).to(device)
     
     model.load_state_dict(ckpt['model_state'])

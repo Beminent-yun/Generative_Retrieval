@@ -33,6 +33,8 @@ CONFIG = {
     "codebook_size":   256,
     "use_user_token":  False,
     "target_loss_weights": [0.4, 0.3, 0.2, 0.1],
+    "hierarchical_attention_enabled": True,
+    "attention_layout": ["intra", "original", "original", "cross"],
     "max_seq_len":     50,
     "use_sliding_window": True,
     "sliding_window_mode": "sample_per_epoch",
@@ -84,6 +86,13 @@ def parse_int_list_arg(value: str | None) -> list[int] | None:
     return values if values else None
 
 
+def parse_str_list_arg(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    values = [x.strip() for x in value.split(",") if x.strip()]
+    return values if values else None
+
+
 def build_train_config_from_cli(base_config: dict) -> dict:
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None, help="Override resume flag: true/false")
@@ -94,6 +103,8 @@ def build_train_config_from_cli(base_config: dict) -> dict:
     parser.add_argument("--train_eval_beam_size", type=int, default=None)
     parser.add_argument("--beam_schedule", type=str, default=None, help="comma-separated beam schedule")
     parser.add_argument("--train_eval_beam_schedule", type=str, default=None, help="comma-separated train-eval beam schedule")
+    parser.add_argument("--hierarchical_attention_enabled", type=str, default=None, help="Override hierarchical attention flag: true/false")
+    parser.add_argument("--attention_layout", type=str, default=None, help="comma-separated attention layout, e.g. intra,original,original,cross")
     args = parser.parse_args()
 
     config = dict(base_config)
@@ -110,6 +121,8 @@ def build_train_config_from_cli(base_config: dict) -> dict:
         config["beam_size"] = args.beam_size
     if args.train_eval_beam_size is not None:
         config["train_eval_beam_size"] = args.train_eval_beam_size
+    if args.hierarchical_attention_enabled is not None:
+        config["hierarchical_attention_enabled"] = parse_bool_arg(args.hierarchical_attention_enabled)
 
     beam_schedule = parse_int_list_arg(args.beam_schedule)
     if beam_schedule is not None:
@@ -118,6 +131,10 @@ def build_train_config_from_cli(base_config: dict) -> dict:
     train_eval_beam_schedule = parse_int_list_arg(args.train_eval_beam_schedule)
     if train_eval_beam_schedule is not None:
         config["train_eval_beam_schedule"] = train_eval_beam_schedule
+
+    attention_layout = parse_str_list_arg(args.attention_layout)
+    if attention_layout is not None:
+        config["attention_layout"] = attention_layout
 
     return config
 
@@ -398,8 +415,15 @@ def train_rec(config:dict = CONFIG):
         num_rq_layers=num_rq_layers,
         codebook_size=config['codebook_size'],
         use_user_token=config.get('use_user_token', True),
-        target_loss_weights=target_loss_weights
+        target_loss_weights=target_loss_weights,
+        hierarchical_attention_enabled=config.get('hierarchical_attention_enabled', False),
+        attention_layout=config.get('attention_layout')
     ).to(device)
+    print(
+        "Attention layout | "
+        f"enabled={config.get('hierarchical_attention_enabled', False)} "
+        f"layout={model.attention_layout}"
+    )
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f'总参数量：{total_params}')

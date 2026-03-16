@@ -19,7 +19,12 @@ class CausalSelfAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.residual_dropout = nn.Dropout(dropout_rate)
         
-    def forward(self, x:torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x:torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+        structural_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         B, T, C = x.shape   # [B, T, d_model]
         
         QKV = self.qkv_proj(x)  # [B, T, 3*d_model]
@@ -30,19 +35,18 @@ class CausalSelfAttention(nn.Module):
         V = V.view(B, T, self.num_head, self.head_dim).transpose(1, 2)  # [B, H, T, D]
         
         atten_mask = None   # 既不是PAD也不是未来时间步的token
-        use_causal_flag = True
-        
-        if padding_mask is not None:
-            """
-            query\key   PAD PAD BOS A0 A1
-            PAD          0   0   0  0  0
-            PAD          0   0   0  0  0
-            BOS          0   0   1  0  0
-            A0           0   0   1  1  0
-            A1           0   0   1  1  1
+        use_causal_flag = structural_mask is None
 
-            """
+        key_mask = None
+        if padding_mask is not None:
             key_mask = padding_mask[:, None, None, :].bool()    # [B, 1, 1, T]
+
+        if structural_mask is not None:
+            atten_mask = structural_mask.view(1, 1, T, T).bool()
+            if key_mask is not None:
+                atten_mask = atten_mask & key_mask
+            use_causal_flag = False
+        elif key_mask is not None:
             causal_mask = torch.ones((T, T), device=x.device, dtype=torch.bool).tril()
             atten_mask = key_mask & causal_mask.view(1, 1, T, T)
             use_causal_flag = False

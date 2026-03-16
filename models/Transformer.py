@@ -36,15 +36,28 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model:int, num_head:int, dim_ffn:int, dropout_rate:float):
+    def __init__(
+        self,
+        d_model:int,
+        num_head:int,
+        dim_ffn:int,
+        dropout_rate:float,
+        attention_mode: str = "original"
+    ):
         super().__init__()
+        self.attention_mode = attention_mode
         self.norm1 = nn.LayerNorm(d_model)
         self.attention = CausalSelfAttention(d_model, num_head, dropout_rate)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = FeedForward(d_model, dim_ffn, dropout_rate)
     
-    def forward(self, x:torch.Tensor, padding_mask:torch.Tensor | None = None) -> torch.Tensor:
-        x = x + self.attention(self.norm1(x), padding_mask=padding_mask)
+    def forward(
+        self,
+        x:torch.Tensor,
+        padding_mask:torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        x = x + self.attention(self.norm1(x), padding_mask=padding_mask, structural_mask=attn_mask)
         x = x + self.ffn(self.norm2(x))
         
         if padding_mask is not None:
@@ -68,18 +81,27 @@ class CausalTransformer(nn.Module):
                  num_rq_layers:int = 3,
                  codebook_size:int = 256,
                  use_user_token: bool = True,
-                 target_loss_weights: list[float] | None = None):
+                 target_loss_weights: list[float] | None = None,
+                 hierarchical_attention_enabled: bool = False,
+                 attention_layout: list[str] | None = None):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.num_rq_layers = num_rq_layers
         self.codebook_size = codebook_size
         self.use_user_token = use_user_token
+        self.hierarchical_attention_enabled = hierarchical_attention_enabled
         self.CODE_OFFSET = 3
         self.PAD_TOKEN = 0
         self._causal_mask_cache: dict[tuple[str, int], torch.Tensor] = {}
         self._rq_pos_cache: dict[tuple[str, int], torch.Tensor] = {}
         self._item_pos_cache:dict[tuple[str, int], torch.Tensor] = {}
+        self._structural_mask_cache: dict[tuple[str, int, str], torch.Tensor] = {}
+        self.attention_layout = self._resolve_attention_layout(
+            num_layers=num_layers,
+            hierarchical_attention_enabled=hierarchical_attention_enabled,
+            attention_layout=attention_layout
+        )
 
         self.user_emb = None
         if self.use_user_token:
@@ -116,8 +138,9 @@ class CausalTransformer(nn.Module):
                 d_model=d_model,
                 num_head=num_head,
                 dim_ffn=dim_ffn,
-                dropout_rate=dropout_rate
-            ) for _ in range(num_layers)
+                dropout_rate=dropout_rate,
+                attention_mode=self.attention_layout[layer_idx]
+            ) for layer_idx in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(d_model)
         
@@ -147,6 +170,39 @@ class CausalTransformer(nn.Module):
     
     def _cache_key(self, device: torch.device, seq_len: int) -> tuple[str, int]:
         return (str(device), seq_len)
+
+
+    def _resolve_attention_layout(
+        self,
+        num_layers: int,
+        hierarchical_attention_enabled: bool,
+        attention_layout: list[str] | None
+    ) -> list[str]:
+        valid_modes = {"original", "intra", "cross"}
+
+        if not hierarchical_attention_enabled:
+            layout = ["original"] * num_layers
+        elif attention_layout is None:
+            if num_layers == 4:
+                layout = ["intra", "original", "original", "cross"]
+            elif num_layers == 6:
+                layout = ["intra", "intra", "original", "original", "cross", "cross"]
+            else:
+                layout = ["original"] * num_layers
+        else:
+            if len(attention_layout) != num_layers:
+                raise ValueError(
+                    f"attention_layout length ({len(attention_layout)}) must equal num_layers ({num_layers})"
+                )
+            layout = [str(mode).lower() for mode in attention_layout]
+
+        invalid_modes = sorted(set(layout) - valid_modes)
+        if invalid_modes:
+            raise ValueError(
+                f"Unsupported attention mode(s): {invalid_modes}. "
+                f"Supported modes are {sorted(valid_modes)}"
+            )
+        return layout
     
 
     def _make_causal_mask(self, seq_len:int, device) -> torch.Tensor:
@@ -161,6 +217,39 @@ class CausalTransformer(nn.Module):
                 diagonal=1
             )
         return self._causal_mask_cache[cache_key]
+
+
+    def _make_structural_attention_mask(
+        self,
+        seq_len: int,
+        device: torch.device,
+        mode: str,
+        item_pos_id: torch.Tensor,
+        rq_pos_id: torch.Tensor
+    ) -> torch.Tensor:
+        cache_key = (str(device), seq_len, mode)
+        if cache_key in self._structural_mask_cache:
+            return self._structural_mask_cache[cache_key]
+
+        causal_mask = self._make_causal_mask(seq_len, device)
+        causal_allow = ~causal_mask
+
+        if mode == "original":
+            allow_mask = causal_allow
+        elif mode == "intra":
+            same_item = item_pos_id.unsqueeze(1) == item_pos_id.unsqueeze(0)
+            bos_visible = torch.zeros((seq_len, seq_len), dtype=torch.bool, device=device)
+            bos_visible[:, 0] = True
+            allow_mask = causal_allow & (same_item | bos_visible)
+        elif mode == "cross":
+            is_anchor = rq_pos_id == 0
+            anchor_visible = is_anchor.unsqueeze(0).expand(seq_len, -1)
+            allow_mask = causal_allow & anchor_visible
+        else:
+            raise ValueError(f"Unsupported attention mode: {mode}")
+
+        self._structural_mask_cache[cache_key] = allow_mask
+        return allow_mask
         
         
     def _make_item_position_ids(self, seq_len:int, device) -> torch.Tensor:
@@ -323,7 +412,14 @@ class CausalTransformer(nn.Module):
         x = x * compact_mask.unsqueeze(-1).to(x.dtype)
         
         for block in self.blocks:
-            x = block(x, padding_mask=compact_mask)
+            attn_mask = self._make_structural_attention_mask(
+                seq_len=seq_len,
+                device=device,
+                mode=block.attention_mode,
+                item_pos_id=item_pos_id,
+                rq_pos_id=rq_pos_id
+            )
+            x = block(x, padding_mask=compact_mask, attn_mask=attn_mask)
         
         x = self.final_norm(x)
         x = x * compact_mask.unsqueeze(-1).to(x.dtype)

@@ -33,6 +33,9 @@ CONFIG = {
     "codebook_size":   256,
     "use_user_token":  False,
     "target_loss_weights": [0.4, 0.3, 0.2, 0.1],
+    "target_loss_weighting": "anneal_to_uniform",
+    "target_loss_weight_alpha": 0.7,
+    "target_loss_weight_anneal_ratio": 0.4,
     "hierarchical_attention_enabled": True,
     "attention_layout": ["intra", "original", "original", "cross"],
     "max_seq_len":     50,
@@ -103,6 +106,10 @@ def build_train_config_from_cli(base_config: dict) -> dict:
     parser.add_argument("--train_eval_beam_size", type=int, default=None)
     parser.add_argument("--beam_schedule", type=str, default=None, help="comma-separated beam schedule")
     parser.add_argument("--train_eval_beam_schedule", type=str, default=None, help="comma-separated train-eval beam schedule")
+    parser.add_argument("--target_loss_weighting", type=str, default=None, help="constant|uniform|exp|anneal_to_uniform")
+    parser.add_argument("--target_loss_weights", type=str, default=None, help="comma-separated constant weights, e.g. 0.4,0.3,0.2,0.1")
+    parser.add_argument("--target_loss_weight_alpha", type=float, default=None)
+    parser.add_argument("--target_loss_weight_anneal_ratio", type=float, default=None)
     parser.add_argument("--hierarchical_attention_enabled", type=str, default=None, help="Override hierarchical attention flag: true/false")
     parser.add_argument("--attention_layout", type=str, default=None, help="comma-separated attention layout, e.g. intra,original,original,cross")
     args = parser.parse_args()
@@ -121,6 +128,12 @@ def build_train_config_from_cli(base_config: dict) -> dict:
         config["beam_size"] = args.beam_size
     if args.train_eval_beam_size is not None:
         config["train_eval_beam_size"] = args.train_eval_beam_size
+    if args.target_loss_weighting is not None:
+        config["target_loss_weighting"] = args.target_loss_weighting
+    if args.target_loss_weight_alpha is not None:
+        config["target_loss_weight_alpha"] = args.target_loss_weight_alpha
+    if args.target_loss_weight_anneal_ratio is not None:
+        config["target_loss_weight_anneal_ratio"] = args.target_loss_weight_anneal_ratio
     if args.hierarchical_attention_enabled is not None:
         config["hierarchical_attention_enabled"] = parse_bool_arg(args.hierarchical_attention_enabled)
 
@@ -131,6 +144,10 @@ def build_train_config_from_cli(base_config: dict) -> dict:
     train_eval_beam_schedule = parse_int_list_arg(args.train_eval_beam_schedule)
     if train_eval_beam_schedule is not None:
         config["train_eval_beam_schedule"] = train_eval_beam_schedule
+
+    target_loss_weights = args.target_loss_weights
+    if target_loss_weights is not None:
+        config["target_loss_weights"] = [float(x.strip()) for x in target_loss_weights.split(",") if x.strip()]
 
     attention_layout = parse_str_list_arg(args.attention_layout)
     if attention_layout is not None:
@@ -246,6 +263,39 @@ def resolve_amp_settings(config: dict, device: str) -> tuple[bool, torch.dtype |
 
     grad_scaler_enabled = chosen_dtype == torch.float16
     return True, chosen_dtype, grad_scaler_enabled
+
+
+def build_exponential_target_weights(num_rq_layers: int, alpha: float) -> torch.Tensor:
+    positions = torch.arange(num_rq_layers, dtype=torch.float32)
+    weights = torch.exp(-alpha * positions)
+    return weights / weights.sum()
+
+
+def resolve_epoch_target_loss_weights(config: dict, num_rq_layers: int, epoch: int) -> torch.Tensor:
+    mode = str(config.get("target_loss_weighting", "constant")).lower()
+
+    if mode == "constant":
+        weights = torch.tensor(config["target_loss_weights"], dtype=torch.float32)
+    elif mode == "uniform":
+        weights = torch.ones(num_rq_layers, dtype=torch.float32)
+    elif mode == "exp":
+        alpha = float(config.get("target_loss_weight_alpha", 0.7))
+        weights = build_exponential_target_weights(num_rq_layers, alpha)
+    elif mode == "anneal_to_uniform":
+        alpha = float(config.get("target_loss_weight_alpha", 0.7))
+        anneal_ratio = float(config.get("target_loss_weight_anneal_ratio", 0.4))
+        anneal_epochs = max(1, int(np.ceil(config["epochs"] * anneal_ratio)))
+        front_heavy = build_exponential_target_weights(num_rq_layers, alpha)
+        uniform = torch.ones(num_rq_layers, dtype=torch.float32) / num_rq_layers
+        if anneal_epochs == 1:
+            progress = 1.0
+        else:
+            progress = min(max((epoch - 1) / (anneal_epochs - 1), 0.0), 1.0)
+        weights = (1.0 - progress) * front_heavy + progress * uniform
+    else:
+        raise ValueError(f"Unsupported target_loss_weighting: {config.get('target_loss_weighting')}")
+
+    return weights / weights.sum()
     
 
 def train_one_epoch(
@@ -254,6 +304,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: str,
     epoch: int,
+    loss_weights_override: torch.Tensor | None = None,
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
     scaler: torch.amp.GradScaler | None = None,
@@ -284,7 +335,13 @@ def train_one_epoch(
             dtype=amp_dtype,
             enabled=amp_enabled
         ):
-            outputs = model.compute_loss(input_ids, attention_mask, target_ids, user_ids)
+            outputs = model.compute_loss(
+                input_ids,
+                attention_mask,
+                target_ids,
+                user_ids,
+                loss_weights_override=loss_weights_override
+            )
             loss = outputs["loss"]
             exact_acc = outputs["exact_acc"]
             token_acc = outputs["token_acc"]
@@ -493,11 +550,17 @@ def train_rec(config:dict = CONFIG):
     for epoch in range(start_epoch, config['epochs'] + 1):
         # update learning rate
         current_lr = scheduler.step(epoch)
+        epoch_loss_weights = resolve_epoch_target_loss_weights(config, num_rq_layers, epoch)
 
         if hasattr(train_loader.dataset, "resample_samples"):
             train_loader.dataset.resample_samples(epoch)
         train_num_samples = len(train_loader.dataset)
         print(f"Epoch {epoch:3d} train_samples={train_num_samples}")
+        print(
+            "Target loss weights | mode="
+            f"{config.get('target_loss_weighting', 'constant')} "
+            f"weights={[round(float(w), 4) for w in epoch_loss_weights.tolist()]}"
+        )
         
         # 训练一个epoch
         train_metrics = train_one_epoch(
@@ -506,6 +569,7 @@ def train_rec(config:dict = CONFIG):
             optimizer,
             device,
             epoch,
+            loss_weights_override=epoch_loss_weights,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             scaler=scaler,
@@ -549,6 +613,7 @@ def train_rec(config:dict = CONFIG):
                 'train_exact_acc': train_exact_acc,
                 'train_token_acc': train_token_acc,
                 'train_layer_acc': train_layer_acc,
+                'train_target_loss_weights': [float(v) for v in epoch_loss_weights.tolist()],
                 'train_num_samples': train_num_samples,
                 'lr': current_lr,
                 'amp_enabled': amp_enabled,
@@ -571,6 +636,8 @@ def train_rec(config:dict = CONFIG):
                 'val/decode_time_sec': eval_time,
                 **{f'val/{k}': v for k, v in val_metrics.items()}
             }
+            for idx, value in enumerate(epoch_loss_weights.tolist()):
+                train_log_payload[f'train/target_loss_weight_c{idx}'] = float(value)
             for idx, value in enumerate(train_layer_acc):
                 train_log_payload[f'train/layer_acc_c{idx}'] = value
             swanlab.log(train_log_payload, step=epoch)
@@ -632,6 +699,8 @@ def train_rec(config:dict = CONFIG):
                 'train/amp_enabled': float(amp_enabled),
                 'train/grad_scaler_enabled': float(scaler.is_enabled()),
             }
+            for idx, value in enumerate(epoch_loss_weights.tolist()):
+                train_log_payload[f'train/target_loss_weight_c{idx}'] = float(value)
             for idx, value in enumerate(train_layer_acc):
                 train_log_payload[f'train/layer_acc_c{idx}'] = value
             swanlab.log(train_log_payload, step=epoch)

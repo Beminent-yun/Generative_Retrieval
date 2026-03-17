@@ -488,7 +488,8 @@ class CausalTransformer(nn.Module):
     def compute_loss(self,input_ids: torch.Tensor,  # [B, T]
                      attention_mask:torch.Tensor,   # [B, T]
                      target_ids:torch.Tensor,   # [B, L] 下一个item(目标)的语义ID
-                     user_ids: torch.Tensor
+                     user_ids: torch.Tensor,
+                     loss_weights_override: torch.Tensor | None = None
                      )->dict:
         """
         Teacher forcing 训练损失
@@ -519,7 +520,8 @@ class CausalTransformer(nn.Module):
             reduction='none'
         ).view(target_ids.size(0), L)
 
-        weights = self.target_loss_weights.view(1, L)
+        weights = self.target_loss_weights if loss_weights_override is None else loss_weights_override
+        weights = weights.to(device=per_token_loss.device, dtype=per_token_loss.dtype).view(1, L)
         loss = (per_token_loss * weights).sum() / (target_ids.size(0) * weights.sum())
         
         # Compute accuracy metrics at different granularities.
